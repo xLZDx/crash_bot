@@ -1,0 +1,42 @@
+# ── secrets / sessions (NEVER commit) ────────────────────────────────────────
+bcgame_session*.json
+*session*.json
+*cookie*
+*credential*
+storage_state*.json
+auth*.json
+.env
+.env.*
+*.env
+
+# ── data / state / models ────────────────────────────────────────────────────
+data/
+logs/
+models/
+*.duckdb
+*.duckdb.wal
+*.duckdb.tmp
+*.jsonl
+
+# ── backups / scratch ────────────────────────────────────────────────────────
+*.bak
+*.bak_*
+*.bak*
+*.tmp
+*.orig
+pytest-tmp*/
+
+# ── python ───────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+venv/
+.venv/
+env/
+
+# ── os / editor ──────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
