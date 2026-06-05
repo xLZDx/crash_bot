@@ -725,6 +725,11 @@ def _scale_from_audit() -> float:
                 r = json.loads(line)
                 event = r.get("event", "")
                 result = r.get("result", "")
+                # A scale-reset marker (cooldown OR an unplaced/suspended bet) ends
+                # the consecutive-loss count -> the ladder restarts at 1 ($0.01) after
+                # it, so a long losing streak does NOT stay pinned at MAX_SCALE ($0.08).
+                if event in ("cooldown_reset", "suspended_reset"):
+                    break
                 if event in ("result", "result_db", "result_balance"):
                     if result in ("win",):
                         break  # last played game was win -> stop
@@ -1713,10 +1718,11 @@ def run():
                        bet=bet, profit=-bet, pnl=st["pnl"],
                        consec=st["consec"], bets=st["bets"], scale=st["scale"])
                 if st["consec"] >= CONSEC_TRIGGER:
-                    _log(f"Cooldown: {CONSEC_TRIGGER} losses -> pause {COOLDOWN_ROUNDS} rounds (scale kept)")
+                    _log(f"Cooldown: {CONSEC_TRIGGER} losses -> pause {COOLDOWN_ROUNDS} rounds (scale RESET to 1.0)")
                     st["cooldown"] = COOLDOWN_ROUNDS
-                    # No scale reset (variant C: accumulate across cooldowns)
+                    st["scale"]    = 1.0   # reset ladder so a streak does not stay pinned at MAX ($0.08)
                     st["consec"]   = 0
+                    _audit("cooldown_reset", **round_info, scale=1.0, pnl=st["pnl"])
             else:
                 # Look up actual round result in DB by game_round_id
                 _log(f"Round result unknown — querying DB for game_round {round_info.get('game_round_id')}")
@@ -1753,9 +1759,11 @@ def run():
                                    actual_mult=actual_mult, pnl=st["pnl"],
                                    consec=st["consec"], bets=st["bets"], scale=st["scale"])
                             if st["consec"] >= CONSEC_TRIGGER:
-                                _log(f"Cooldown: {CONSEC_TRIGGER} losses -> pause {COOLDOWN_ROUNDS} rounds (scale kept)")
+                                _log(f"Cooldown: {CONSEC_TRIGGER} losses -> pause {COOLDOWN_ROUNDS} rounds (scale RESET to 1.0)")
                                 st["cooldown"] = COOLDOWN_ROUNDS
+                                st["scale"] = 1.0
                                 st["consec"] = 0
+                                _audit("cooldown_reset", **round_info, scale=1.0, pnl=st["pnl"])
                     else:
                         # Round not in DB yet — skip without updating state
                         _log(f"Round {target_gid} not in DB — skipping (no state change)")
