@@ -308,7 +308,7 @@ class BotAccount:
                         session_bank_sol        = ?,
                         session_rounds          = ?,
                         current_scale           = ?,
-                        last_processed_round_id = ?,
+                        last_processed_round_id = COALESCE(?, last_processed_round_id),
                         updated_at              = ?
                     WHERE id = 1
                 """, [new_total, new_sbank, srounds + 1,

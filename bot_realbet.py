@@ -479,47 +479,11 @@ def _install_network_capture(page):
 
 
 def _parse_ws_round_frame(raw: bytes) -> tuple[str | None, float | None]:
-    """Parse /g/cm ed or st binary frame -> (game_round_id, multiplier). Returns (None,None) if not a round-end frame."""
-    if not raw.startswith(_CM_PREFIX):
-        return None, None
-    rest = raw[len(_CM_PREFIX):]
-    if not (rest.startswith(_ED_SUFFIX) or rest.startswith(_ST_SUFFIX)):
-        return None, None
-    data = rest[2:]
-    game_round_id = None
-    multiplier = None
-    pos = 0
-    while pos < len(data):
-        try:
-            tag_byte = data[pos]; pos += 1
-            wire_type = tag_byte & 0x07
-            field_num = tag_byte >> 3
-            if wire_type == 0:
-                val = 0; shift = 0
-                while True:
-                    b = data[pos]; pos += 1
-                    val |= (b & 0x7F) << shift
-                    if not (b & 0x80): break
-                    shift += 7
-                if field_num == 1:
-                    game_round_id = str(val)
-                elif field_num == 6:
-                    m = val / 100.0
-                    if 1.0 <= m <= 10000.0:
-                        multiplier = round(m, 2)
-            elif wire_type == 2:
-                ln = 0; shift = 0
-                while True:
-                    b = data[pos]; pos += 1
-                    ln |= (b & 0x7F) << shift
-                    if not (b & 0x80): break
-                    shift += 7
-                pos += ln
-            else:
-                break
-        except Exception:
-            break
-    return game_round_id, multiplier
+    """Delegates to ws_protocol.parse_round_frame (shared with live_feed.py).
+    Behavior unchanged: returns (game_round_id, multiplier) or (None, None)."""
+    from ws_protocol import parse_round_frame
+    gid, mult, _suffix = parse_round_frame(raw)
+    return gid, mult
 
 
 def _latest_round_info(retries: int = 6, backoff_s: float = 0.10) -> dict:
