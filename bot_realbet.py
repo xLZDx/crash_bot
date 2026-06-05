@@ -51,10 +51,11 @@ _ST_SUFFIX = b"st"
 # Strategy
 BANK_USD         = 24.83
 BASE_BET_USD     = 0.01      # $0.01 = BCGame minimum
-LOSS_SCALE       = 2.0
-MAX_SCALE        = 64.0      # no-reset variant C: accumulates up to $0.64
-CONSEC_TRIGGER   = 4
-COOLDOWN_ROUNDS  = 4
+# LOSS_SCALE / MAX_SCALE / CONSEC_TRIGGER / COOLDOWN_ROUNDS are the strategy's
+# martingale params and come ONLY from STRATEGY_CFG below (lines ~69-72).
+# Do NOT hardcode duplicates here -- a stale copy (e.g. MAX_SCALE=64) is dead
+# code (overwritten below) but misleads readers into thinking the cap differs
+# from the configured/backtested strategy. Single source of truth = STRATEGY_CFG.
 STOP_LOSS_PCT    = 0.50      # stop at -$6
 TAKE_PROFIT_PCT  = 1.0       # stop at +$12
 INPUT_RETRIES    = 5
