@@ -522,22 +522,39 @@ def _parse_ws_round_frame(raw: bytes) -> tuple[str | None, float | None]:
     return game_round_id, multiplier
 
 
-def _latest_round_info() -> dict:
-    try:
-        with duckdb.connect(str(ROUNDS_DB), read_only=True) as conn:
-            row = conn.execute(
-                """
-                SELECT id, game_round_id, multiplier
-                FROM rounds
-                ORDER BY id DESC
-                LIMIT 1
-                """
-            ).fetchone()
-        if not row:
-            return {}
-        return {"round_id": int(row[0]), "game_round_id": row[1], "last_mult": float(row[2])}
-    except Exception as exc:
-        return {"round_error": str(exc)}
+def _latest_round_info(retries: int = 6, backoff_s: float = 0.10) -> dict:
+    # The collector (main.py collect) holds a brief write-lock on crash.duckdb
+    # while it writes each round. A read here that collides with that window
+    # raises "Could not set lock ... Conflicting lock is held". Previously that
+    # bubbled up as round_error -> the whole bet was skipped (~28% of attempts).
+    # The lock is transient, so retry a few times (<=0.6s total, well within the
+    # betting window) and only surface round_error if it stays locked throughout.
+    last_exc = ""
+    for attempt in range(retries):
+        try:
+            with duckdb.connect(str(ROUNDS_DB), read_only=True) as conn:
+                row = conn.execute(
+                    """
+                    SELECT id, game_round_id, multiplier
+                    FROM rounds
+                    ORDER BY id DESC
+                    LIMIT 1
+                    """
+                ).fetchone()
+            if not row:
+                return {}
+            return {"round_id": int(row[0]), "game_round_id": row[1], "last_mult": float(row[2])}
+        except Exception as exc:
+            last_exc = str(exc)
+            low = last_exc.lower()
+            if "lock" in low or "conflicting" in low:
+                if attempt < retries - 1:
+                    time.sleep(backoff_s)
+                    continue
+            else:
+                # Non-lock error (e.g. corrupt/missing DB): do not spin.
+                return {"round_error": last_exc}
+    return {"round_error": last_exc}
 
 
 def _wait_for_settled_round(after_round_id, timeout=ROUND_SETTLE_TIMEOUT,
