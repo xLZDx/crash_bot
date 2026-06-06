@@ -10,13 +10,34 @@ data/bot_state_<name>.duckdb file). Pass --all to backtest every key in
 STRATEGIES.
 """
 import argparse
+import csv
 import glob
 import os
 import sys
+from datetime import datetime, timezone
 import duckdb
 sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
 from bot_strategy import STRATEGIES, decide, new_session_bank
+from db_util import connect_ro
+
+
+def _now_dual() -> str:
+    now = datetime.now(timezone.utc)
+    try:
+        from zoneinfo import ZoneInfo
+        loc = now.astimezone(ZoneInfo("Europe/Chisinau"))
+        return (f"{loc.strftime('%Y-%m-%d %H:%M')} local (Europe/Chisinau) / "
+                f"{now.strftime('%H:%M')} UTC")
+    except Exception:
+        return f"{now.strftime('%Y-%m-%d %H:%M')} UTC"
+
+
+def _fmt_dt(dt) -> str:
+    try:
+        return dt.strftime("%Y-%m-%d %H:%M")
+    except Exception:
+        return str(dt)
 
 DB          = "data/crash.duckdb"
 START_BANK  = 100.0
@@ -232,68 +253,100 @@ def _pct(v: float, w: int) -> str:
     return f"{v:+.2f}%".rjust(w)
 
 
-def print_table(results: list, n_rounds: int, total_days: float):
-    medals = {0: "[1]", 1: "[2]", 2: "[3]"}
+def print_table(results: list, n_rounds: int, total_days: float, meta: dict = None):
+    meta = meta or {}
+    medals_t = {0: "[1]", 1: "[2]", 2: "[3]"}
+    medals_m = {0: "\U0001F947", 1: "\U0001F948", 2: "\U0001F949"}
+    profit = sum(1 for r in results if "error" not in r and r["final"] > START_BANK)
 
-    hdr = (
-        f"{'#':>{W_NUM}}{SEP}"
-        f"{'Strategy':<{W_STR}}{SEP}"
-        f"{'Balance $':>{W_BAL}}{SEP}"
-        f"{'P&L $24h':>{W_P24}}{SEP}"
-        f"{'P&L $48h':>{W_P48}}{SEP}"
-        f"{'%1h':>{W_1H}}{SEP}"
-        f"{'%12h':>{W_12H}}{SEP}"
-        f"{'%24h':>{W_24H}}{SEP}"
-        f"{'WR':>{W_WR}}{SEP}"
-        f"{'Bets':>{W_BET}}{SEP}"
-        f"{'Days':>{W_DAY}}{SEP}"
-        f"{'MaxDD':>{W_MDD}}{SEP}"
-        f"Details"
+    head = [
+        f"Backtest $100/strategy -- {meta.get('generated', _now_dual())}",
+        f"Strategies: {len(results)} | Rounds used: {n_rounds:,} ({total_days:.1f} days)",
+    ]
+    if meta.get("period_start"):
+        head.append(f"Data period: {meta['period_start']} -> {meta['period_end']}")
+    if meta.get("completeness_known") is False:
+        why = (f"query failed: {meta.get('completeness_err')}"
+               if meta.get("completeness_err") else "no game_round_id column")
+        head.append(f"Round completeness: UNKNOWN ({why})")
+    elif meta.get("expected"):
+        head.append(f"Round completeness: {meta['distinct']:,} / {meta['expected']:,} "
+                    f"collected -- MISSING {meta['missing']:,} "
+                    f"({meta['coverage']:.2f}% coverage)")
+    head.append(f"Profitable: {profit} / {len(results)}")
+
+    txt_hdr = (
+        f"{'#':>{W_NUM}}{SEP}{'Strategy':<{W_STR}}{SEP}{'Balance $':>{W_BAL}}{SEP}"
+        f"{'P&L $24h':>{W_P24}}{SEP}{'P&L $48h':>{W_P48}}{SEP}{'%1h':>{W_1H}}{SEP}"
+        f"{'%12h':>{W_12H}}{SEP}{'%24h':>{W_24H}}{SEP}{'WR':>{W_WR}}{SEP}"
+        f"{'Bets':>{W_BET}}{SEP}{'Days':>{W_DAY}}{SEP}{'MaxDD':>{W_MDD}}{SEP}Details"
     )
-    bar = "-" * len(hdr)
+    bar = "-" * len(txt_hdr)
+    txt = [""] + ["  " + h for h in head] + ["", "  " + txt_hdr, "  " + bar]
 
-    print()
-    print(f"  Backtest $100/strategy -- {len(results)} strategies | {n_rounds:,} rounds | {total_days:.1f} days")
-    print()
-    print("  " + hdr)
-    print("  " + bar)
+    md = ["# " + head[0], ""] + [f"- {h}" for h in head[1:]] + [""]
+    mdcols = ["#", "Strategy", "Balance $", "P&L $24h", "P&L $48h", "%1h", "%12h",
+              "%24h", "WR", "Bets", "Days", "MaxDD", "Details"]
+    md.append("| " + " | ".join(mdcols) + " |")
+    md.append("| " + " | ".join(["--:", "---"] + ["--:"] * 10 + ["---"]) + " |")
+
+    csv_rows = [["#", "Strategy", "Balance", "PnL_24h", "PnL_48h", "pct_1h", "pct_12h",
+                 "pct_24h", "WR", "Bets", "Days", "MaxDD_pct", "Details"]]
 
     for idx, r in enumerate(results):
-        num_s = f"{idx + 1:>{W_NUM}}"
+        num = idx + 1
         if "error" in r:
-            print(f"  {num_s}{SEP}{r['name']:<{W_STR}}  ERROR: {r['error']}")
+            txt.append(f"  {num:>{W_NUM}}{SEP}{r['name']:<{W_STR}}  ERROR: {r['error']}")
+            md.append(f"| {num} | {r['name']} | ERROR |  |  |  |  |  |  |  |  |  | {r['error']} |")
+            csv_rows.append([num, r["name"], "ERROR", "", "", "", "", "", "", "", "", "", r["error"]])
             continue
-
-        medal = medals.get(idx, "") if r["final"] > START_BANK else ""
-        mdd   = r["max_dd"]
-        flag  = "*" if mdd > 5 else ""
-
-        name_field = (medal + r["name"])[:W_STR]
-        bal_s = f"${r['final']:.2f}".rjust(W_BAL)
-        wr_s  = f"{r['win_rate']:.1f}%".rjust(W_WR) if r["bets"] > 0 else "--".rjust(W_WR)
-        day_s = f"{r['days']:.1f}d".rjust(W_DAY)
-        mdd_s = f"{flag}{mdd:.2f}%".rjust(W_MDD)
-
-        print(
-            f"  {num_s}{SEP}"
-            f"{name_field:<{W_STR}}{SEP}"
-            f"{bal_s}{SEP}"
-            f"{_usd(r['pnl_24h'], W_P24)}{SEP}"
-            f"{_usd(r['pnl_48h'], W_P48)}{SEP}"
-            f"{_pct(r['pct_1h'],  W_1H)}{SEP}"
-            f"{_pct(r['pct_12h'], W_12H)}{SEP}"
-            f"{_pct(r['pct_24h'], W_24H)}{SEP}"
-            f"{wr_s}{SEP}"
-            f"{r['bets']:>{W_BET}}{SEP}"
-            f"{day_s}{SEP}"
-            f"{mdd_s}{SEP}"
-            f"{_cfg_details(r['cfg'])}"
+        prof = r["final"] > START_BANK
+        mt = medals_t.get(idx, "") if prof else ""
+        mm = medals_m.get(idx, "") if prof else ""
+        mdd = r["max_dd"]
+        flag = "*" if mdd > 5 else ""
+        name_t = (mt + r["name"])[:W_STR]
+        bal = f"${r['final']:.2f}"
+        wr = f"{r['win_rate']:.1f}%" if r["bets"] > 0 else "--"
+        day = f"{r['days']:.1f}d"
+        mddp = f"{mdd:.2f}%"
+        det = _cfg_details(r["cfg"])
+        txt.append(
+            f"  {num:>{W_NUM}}{SEP}{name_t:<{W_STR}}{SEP}{bal.rjust(W_BAL)}{SEP}"
+            f"{_usd(r['pnl_24h'], W_P24)}{SEP}{_usd(r['pnl_48h'], W_P48)}{SEP}"
+            f"{_pct(r['pct_1h'], W_1H)}{SEP}{_pct(r['pct_12h'], W_12H)}{SEP}"
+            f"{_pct(r['pct_24h'], W_24H)}{SEP}{wr.rjust(W_WR)}{SEP}{r['bets']:>{W_BET}}{SEP}"
+            f"{day.rjust(W_DAY)}{SEP}{(flag + mddp).rjust(W_MDD)}{SEP}{det}"
         )
+        mdd_md = ("\U0001F534**" + mddp + "**") if mdd > 5 else mddp
+        md.append(
+            f"| {num} | {mm}{r['name']} | {bal} | {_usd(r['pnl_24h'], 0).strip()} | "
+            f"{_usd(r['pnl_48h'], 0).strip()} | {_pct(r['pct_1h'], 0).strip()} | "
+            f"{_pct(r['pct_12h'], 0).strip()} | {_pct(r['pct_24h'], 0).strip()} | {wr} | "
+            f"{r['bets']} | {day} | {mdd_md} | {det} |"
+        )
+        csv_rows.append([
+            num, r["name"], f"{r['final']:.2f}", f"{r['pnl_24h']:.2f}", f"{r['pnl_48h']:.2f}",
+            f"{r['pct_1h']:.2f}", f"{r['pct_12h']:.2f}", f"{r['pct_24h']:.2f}",
+            (f"{r['win_rate']:.1f}" if r["bets"] > 0 else ""),
+            r["bets"], f"{r['days']:.1f}", f"{mdd:.2f}", det,
+        ])
 
-    print("  " + bar)
-    profitable = sum(1 for r in results if "error" not in r and r["final"] > START_BANK)
-    print(f"  Profitable: {profitable} / {len(results)}")
-    print()
+    txt += ["  " + bar, f"  Profitable: {profit} / {len(results)}", ""]
+    md += ["", f"**Profitable: {profit} / {len(results)}**"]
+
+    txt_text = "\n".join(txt)
+    print(txt_text)
+
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    base = os.path.join("data", f"backtest_table_{stamp}")
+    with open(base + ".txt", "w", encoding="utf-8") as f:
+        f.write(txt_text + "\n")
+    with open(base + ".md", "w", encoding="utf-8") as f:
+        f.write("\n".join(md) + "\n")
+    with open(base + ".csv", "w", encoding="utf-8", newline="") as f:
+        csv.writer(f).writerows(csv_rows)
+    print(f"\n  saved: {base}.txt | .md | .csv")
 
 
 def _discover_paper_strategies(data_dir: str = "data") -> list:
@@ -313,28 +366,52 @@ def main():
     args = ap.parse_args()
 
     print("Loading rounds ...", end="", flush=True)
-    conn = duckdb.connect(DB, read_only=True)
-
-    cols = [row[1] for row in conn.execute("PRAGMA table_info(rounds)").fetchall()]
-    ts_col = next(
-        (c for c in cols if any(k in c.lower() for k in ("ts", "time", "creat", "start", "ended"))),
-        None,
-    )
-
-    if ts_col:
-        rows  = conn.execute(f"SELECT multiplier, {ts_col} FROM rounds ORDER BY id ASC").fetchall()
-        mults = [r[0] for r in rows]
-        tss   = [r[1] for r in rows]
-    else:
-        rows  = conn.execute("SELECT multiplier FROM rounds ORDER BY id ASC").fetchall()
-        mults = [r[0] for r in rows]
-        tss   = []
-
-    conn.close()
+    conn = connect_ro(DB)
+    completeness_err = None
+    gmin = gmax = gd = None
+    try:
+        cols = [row[1] for row in conn.execute("PRAGMA table_info(rounds)").fetchall()]
+        ts_col = next(
+            (c for c in cols if any(k in c.lower() for k in ("ts", "time", "creat", "start", "ended"))),
+            None,
+        )
+        if ts_col:
+            rows  = conn.execute(f"SELECT multiplier, {ts_col} FROM rounds ORDER BY id ASC").fetchall()
+            mults = [r[0] for r in rows]
+            tss   = [r[1] for r in rows]
+        else:
+            rows  = conn.execute("SELECT multiplier FROM rounds ORDER BY id ASC").fetchall()
+            mults = [r[0] for r in rows]
+            tss   = []
+        # round-completeness (lost rounds); TRY_CAST drops non-numeric game_round_id
+        try:
+            gmin, gmax, gd = conn.execute(
+                "SELECT MIN(g), MAX(g), COUNT(DISTINCT g) FROM "
+                "(SELECT TRY_CAST(game_round_id AS BIGINT) g FROM rounds) WHERE g IS NOT NULL"
+            ).fetchone()
+        except Exception as e:
+            completeness_err = str(e)[:80]
+    finally:
+        conn.close()
 
     n          = len(mults)
     total_days = _total_days_from_ts(tss, n)
     print(f" {n:,} rounds ({total_days:.1f} days)")
+
+    known = (gmin is not None and gmax is not None and gd is not None)
+    expected = (gmax - gmin + 1) if known else 0
+    missing  = (expected - gd) if (known and expected) else 0
+    meta = {
+        "generated": _now_dual(),
+        "period_start": _fmt_dt(tss[0]) if tss else "?",
+        "period_end":   _fmt_dt(tss[-1]) if tss else "?",
+        "distinct": gd or 0,
+        "expected": expected,
+        "missing": missing,
+        "coverage": (gd / expected * 100.0) if (known and expected) else 0.0,
+        "completeness_known": known,
+        "completeness_err": completeness_err,
+    }
 
     if args.all:
         names = list(STRATEGIES.keys())
@@ -358,7 +435,7 @@ def main():
     print(" " * 60, end="\r")
 
     results.sort(key=lambda r: r.get("final", 0.0), reverse=True)
-    print_table(results, n, total_days)
+    print_table(results, n, total_days, meta)
 
 
 if __name__ == "__main__":
