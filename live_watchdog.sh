@@ -28,7 +28,7 @@ for spec in $BOTS; do
     strat="${spec%%:*}"
     var="${spec##*:}"
     db="data/bot_live_${strat}_${var}.duckdb"
-    mapfile -t pids < <(pgrep -f -- "bot_live\.py --strategy ${strat} --bot-db ${db}\$")
+    mapfile -t pids < <(pgrep -f -- "bot_live\.py.*--bot-db ${db}")
     if [ "${#pids[@]}" -eq 0 ]; then
         nohup "$PY" -B -u bot_live.py --strategy "$strat" --bot-db "$db" \
             --cooldown-scale "$var" >> "logs/bot_live_${var}.log" 2>&1 &

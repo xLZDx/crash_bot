@@ -57,12 +57,18 @@ def handle_event(ev, acct, cfg, st, lat, rng, cooldown_resets, log=lambda *a: No
     if ob is not None:
         won = mult >= ob["cashout"]
         new_scale, cd = apply_scale_and_cooldown(won, cfg, ob["scale"], st["sctx"], cooldown_resets)
-        acct.record_bet(round_db_id=None, game_round_id=gid, bet_sol=ob["bet"],
-                        cashout_target=ob["cashout"], actual_mult=mult, new_scale=new_scale)
-        st["current_scale"] = new_scale
-        st["settled"] += 1
-        if cd:
-            st["cooldown_left"] = cfg.consec_loss_pause
+        try:
+            acct.record_bet(round_db_id=None, game_round_id=gid, bet_sol=ob["bet"],
+                            cashout_target=ob["cashout"], actual_mult=mult, new_scale=new_scale)
+            st["current_scale"] = new_scale
+            st["settled"] += 1
+            if cd:
+                st["cooldown_left"] = cfg.consec_loss_pause
+        except Exception as e:
+            # a failed settle must NOT kill the bot -- survive + log the context
+            st["errors"] = st.get("errors", 0) + 1
+            log(f"record_bet FAILED gid={gid} round_db_id=None lpri={acct.get_state().get('last_processed_round_id')!r} err={str(e)[:90]}")
+            st["current_scale"] = new_scale
         st["open_bet"] = None
     else:
         st["current_scale"] = acct.get_state()["current_scale"]
