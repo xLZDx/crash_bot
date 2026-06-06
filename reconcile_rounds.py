@@ -87,7 +87,22 @@ def load_round_gids(crash_db=CRASH_DB):
         ).fetchall()
         gids = [r[0] for r in rows]
         tmin, tmax = c.execute("SELECT MIN(ts), MAX(ts) FROM rounds").fetchone()
-    meta = {"ts_min": tmin, "ts_max": tmax}
+    # union recovered rounds from the separate backfill store (backfill_rounds.py)
+    backfilled = 0
+    bf = os.path.join(os.path.dirname(crash_db) or ".", "backfill_rounds.duckdb")
+    if os.path.exists(bf):
+        try:
+            with _connect_ro(bf) as bc:
+                brows = bc.execute(
+                    "SELECT DISTINCT TRY_CAST(game_round_id AS BIGINT) g FROM backfill_rounds"
+                ).fetchall()
+            bset = {r[0] for r in brows if r[0] is not None}
+            before = len(gids)
+            gids = sorted(set(gids) | bset)
+            backfilled = len(gids) - before
+        except Exception:
+            pass
+    meta = {"ts_min": tmin, "ts_max": tmax, "backfilled": backfilled}
     return gids, meta
 
 
@@ -160,6 +175,7 @@ def build_report():
     return {
         "generated": _now_dual(),
         "ts_min": meta["ts_min"], "ts_max": meta["ts_max"],
+        "backfilled": meta.get("backfilled", 0),
         "gmin": gmin, "gmax": gmax, "expected": expected,
         "distinct": distinct, "missing": missing,
         "coverage": coverage_pct(distinct, expected),
@@ -237,6 +253,8 @@ def main():
           f"-> MISSING {rep['missing']:,} (coverage {rep['coverage']:.2f}%)")
     print(f"Gap-spans: {len(rep['gaps'])} (outages {len(rep['outages'])}, "
           f"drops {len(rep['drops'])})")
+    if rep.get("backfilled"):
+        print(f"Recovered from backfill store: {rep['backfilled']} rounds")
     print(f"REAL bets: {rep['real']['bets']} orphans {rep['real']['orphans']}")
     errored = [nm for nm, r in rep["paper_recon"].items()
                if isinstance(r, dict) and "error" in r]
