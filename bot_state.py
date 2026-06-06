@@ -302,17 +302,22 @@ class BotAccount:
                       bet_sol, cashout_target, actual_mult, won, pnl,
                       new_total, new_sbank])
 
-                conn.execute("""
-                    UPDATE strategy_state
-                    SET total_bank_sol          = ?,
-                        session_bank_sol        = ?,
-                        session_rounds          = ?,
-                        current_scale           = ?,
-                        last_processed_round_id = COALESCE(?, last_processed_round_id),
-                        updated_at              = ?
-                    WHERE id = 1
-                """, [new_total, new_sbank, srounds + 1,
-                      new_scale, round_db_id, _now()])
+                if round_db_id is None:
+                    # live mode: do NOT touch the replay cursor (omit the column
+                    # entirely -- robust against any NOT NULL state of the column)
+                    conn.execute("""
+                        UPDATE strategy_state
+                        SET total_bank_sol = ?, session_bank_sol = ?, session_rounds = ?,
+                            current_scale = ?, updated_at = ?
+                        WHERE id = 1
+                    """, [new_total, new_sbank, srounds + 1, new_scale, _now()])
+                else:
+                    conn.execute("""
+                        UPDATE strategy_state
+                        SET total_bank_sol = ?, session_bank_sol = ?, session_rounds = ?,
+                            current_scale = ?, last_processed_round_id = ?, updated_at = ?
+                        WHERE id = 1
+                    """, [new_total, new_sbank, srounds + 1, new_scale, round_db_id, _now()])
 
         return {"won": won, "pnl_sol": pnl,
                 "total_bank_after": new_total,
