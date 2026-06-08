@@ -473,6 +473,31 @@ STRATEGIES: dict[str, StrategyConfig] = {
         elliott_delay=1,
         consec_loss_trigger=4, consec_loss_pause=4,
     ),
+    # therm_21: x2.1 thermal-skip + martingale x2 cap 8; 3 losses -> ~30min pause + reset
+    "therm_21": StrategyConfig(
+        name="therm_21",
+        bet_pct=0.0001, cashout=2.1, stop_loss=0.30, stop_profit=1.0,
+        session_frac=1.0, max_rounds=9999, consec_sl_pause=99, bet_hard_cap=0.001,
+        loss_scale=2.0, max_scale=8.0,
+        filter="thermal_skip", thermal_window=10, thermal_threshold=-4,
+        consec_loss_trigger=3, consec_loss_pause=63,   # 3L -> ~30min pause + reset
+    ),
+    # mart_12_pause: x1.2 martingale x2 cap 8 (1,2,4,8); 4 losses -> ~5min pause + reset
+    "mart_12_pause": StrategyConfig(
+        name="mart_12_pause",
+        bet_pct=0.0001, cashout=1.2, stop_loss=0.30, stop_profit=1.0,
+        session_frac=1.0, max_rounds=9999, consec_sl_pause=99, bet_hard_cap=0.001,
+        loss_scale=2.0, max_scale=8.0,
+        consec_loss_trigger=4, consec_loss_pause=11,   # 4L: 1,2,4,8 -> ~5min pause + reset
+    ),
+    # mart_12_reset: x1.2 martingale x2 cap 8 (1,2,4,8); 4 losses -> reset to base, NO pause
+    "mart_12_reset": StrategyConfig(
+        name="mart_12_reset",
+        bet_pct=0.0001, cashout=1.2, stop_loss=0.30, stop_profit=1.0,
+        session_frac=1.0, max_rounds=9999, consec_sl_pause=99, bet_hard_cap=0.001,
+        loss_scale=2.0, max_scale=8.0,
+        consec_loss_trigger=4, consec_loss_pause=0,    # 4L: 1,2,4,8 -> reset, NO pause
+    ),
 }
 
 

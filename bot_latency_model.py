@@ -78,7 +78,7 @@ def load_model(audit_path="data/realbet_execution_audit.jsonl") -> LatencyModel:
                 ts = _ts(r)
                 if gid and ts is not None:
                     attempt_ts[gid] = ts
-            elif ev in ("place_error", "suspended_reset"):
+            elif ev in ("place_error", "suspended_reset", "suspended_carry_scale"):
                 misses += 1
             elif ev == "bet_placed":
                 ts = _ts(r)

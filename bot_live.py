@@ -105,7 +105,7 @@ def main():
     ap = argparse.ArgumentParser(description="Event-driven paper bot (ZMQ)")
     ap.add_argument("--strategy", required=True, choices=list(STRATEGIES.keys()))
     ap.add_argument("--bot-db", required=True)
-    ap.add_argument("--cooldown-scale", choices=["reset", "keep"], default="reset")
+    ap.add_argument("--cooldown-scale", choices=["reset", "keep"], default="keep")
     ap.add_argument("--zmq-endpoint", default=ENDPOINT)
     ap.add_argument("--seed", default="")   # "" = real randomness; int = reproducible
     args = ap.parse_args()

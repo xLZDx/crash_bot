@@ -21,7 +21,7 @@ echo "starting publisher..."
 setsid sh -c "cd /root/crash-collector && exec $PY -u live_feed.py >> logs/live_feed.log 2>&1" </dev/null &
 sleep 4
 echo "starting bots..."
-for v in reset keep; do
+for v in keep; do
     setsid sh -c "cd /root/crash-collector && exec $PY -u bot_live.py --strategy relwave_bad_veto_21 --bot-db data/bot_live_relwave_bad_veto_21_${v}.duckdb --cooldown-scale ${v} >> logs/bot_live_${v}.log 2>&1" </dev/null &
 done
 sleep 2

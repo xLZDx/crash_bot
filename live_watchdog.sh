@@ -12,7 +12,8 @@ flock -n 9 || { echo "$(date -u +%FT%TZ) another watchdog running, skip"; exit 0
 ts() { date -u +%FT%TZ; }
 
 # "strategy:variant" -> state DB data/bot_live_<strategy>_<variant>.duckdb
-BOTS="relwave_bad_veto_21:reset relwave_bad_veto_21:keep"
+# Keep-only mirrors real bot late-bet behavior (no ladder reset on suspend).
+BOTS="relwave_bad_veto_21:keep"
 
 # 1) publisher (exactly one)
 mapfile -t fpids < <(pgrep -f 'live_feed\.py')

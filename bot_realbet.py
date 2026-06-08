@@ -58,6 +58,8 @@ BASE_BET_USD     = 0.01      # $0.01 = BCGame minimum
 # from the configured/backtested strategy. Single source of truth = STRATEGY_CFG.
 STOP_LOSS_PCT    = 0.50      # stop at -$6
 TAKE_PROFIT_PCT  = 1.0       # stop at +$12
+POST_LOSS_DELAY_S = 7.0      # after loss, delay next bet attempt
+POST_WIN_DELAY_S  = 1.0      # after win, short delay before next attempt
 INPUT_RETRIES    = 5
 ROUND_SETTLE_TIMEOUT = 95
 EXECUTOR         = os.environ.get("REALBET_EXECUTOR", "gui").strip().lower()
@@ -83,6 +85,17 @@ def _log(msg):
     ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
     line = f"[{ts}] {msg}"
     print(line, flush=True)
+
+    # If service manager already redirects stdout to LOG_FILE, avoid writing the
+    # same line twice by skipping the manual append path.
+    try:
+        out_stat = os.fstat(sys.stdout.fileno())
+        log_stat = os.stat(LOG_FILE)
+        if out_stat.st_dev == log_stat.st_dev and out_stat.st_ino == log_stat.st_ino:
+            return
+    except Exception:
+        pass
+
     with open(LOG_FILE, "a", encoding="utf-8") as f:
         f.write(line + "\n")
 
@@ -90,8 +103,15 @@ def _log(msg):
 def _load_state():
     if STATE_FILE.exists():
         return json.loads(STATE_FILE.read_text())
-    return {"scale": 1.0, "consec": 0, "cooldown": 0,
-            "bets": 0, "wins": 0, "pnl": 0.0}
+    return {
+        "scale": 1.0,
+        "consec": 0,
+        "cooldown": 0,
+        "bets": 0,
+        "wins": 0,
+        "pnl": 0.0,
+        "next_bet_not_before_ts": 0.0,
+    }
 
 
 def _save_state(st):
@@ -1158,7 +1178,11 @@ def run():
     st["strategy"] = STRATEGY_NAME
     _save_state(st)
     _ensure_strategy_start(st, st.get("last_balance_usd"))
-    _log(f"Starting realbet {STRATEGY_NAME} executor={EXECUTOR} | scale={st['scale']} consec={st['consec']} pnl={st['pnl']:+.4f}")
+    _log(
+        f"Starting realbet {STRATEGY_NAME} executor={EXECUTOR} | "
+        f"scale={st['scale']} consec={st['consec']} pnl={st['pnl']:+.4f} | "
+        f"timing(loss={POST_LOSS_DELAY_S:.1f}s, win={POST_WIN_DELAY_S:.1f}s)"
+    )
 
     with sync_playwright() as p:
         # headless=True works on VPS via VPN; headless=False for local Windows
@@ -1577,6 +1601,37 @@ def run():
                 continue
 
             # --- STEP 3: place bet (scale synced from actual played history) ---
+            now_ts = time.time()
+            gate_ts = float(st.get("next_bet_not_before_ts", 0.0) or 0.0)
+            if now_ts < gate_ts:
+                wait_s = gate_ts - now_ts
+                _log(f"Timing gate: waiting {wait_s:.1f}s before next bet")
+                _audit(
+                    "timing_gate_wait",
+                    **round_info,
+                    wait_s=wait_s,
+                    gate_ts=gate_ts,
+                    scale=st["scale"],
+                    pnl=st["pnl"],
+                )
+                time.sleep(wait_s)
+                try:
+                    _, gate_btn_text = _find_bet_button(page)
+                except Exception:
+                    gate_btn_text = ""
+                if not _button_ready(gate_btn_text):
+                    _log(f"Timing gate: betting window closed during wait (btn={gate_btn_text})")
+                    _audit(
+                        "timing_gate_window_missed",
+                        **round_info,
+                        wait_s=wait_s,
+                        gate_ts=gate_ts,
+                        btn=gate_btn_text,
+                        scale=st["scale"],
+                        pnl=st["pnl"],
+                    )
+                    continue
+
             synced_scale = _scale_from_audit()
             if synced_scale != st["scale"]:
                 _log(f"[SCALE SYNC] state={st['scale']:.0f}x -> audit={synced_scale:.0f}x")
@@ -1674,12 +1729,11 @@ def run():
                 _log(f"Place error: {e} — skipping round")
                 _audit("place_error", **round_info, bet=bet, error=str(e), scale=st["scale"], pnl=st["pnl"])
                 if "bet suspended" in err_str or "game has started" in err_str:
-                    # Strategy C: Bet suspended → skip 1 more round → reset scale to 1
-                    st["scale"] = 1.0
-                    st["consec"] = 0
-                    _log(f"BET SUSPENDED: scale reset to 1.0, skipping 1 extra round")
-                    _audit("suspended_reset", **round_info, bet=bet, pnl=st["pnl"])
-                    time.sleep(35)  # skip 1 round (~35s)
+                    # Late-bet reject is a timing skip, not a strategy failure.
+                    # Preserve intended recovery scale for the next round.
+                    _log(f"BET SUSPENDED: carry scale={st['scale']:.1f} to next round (no reset)")
+                    _audit("suspended_carry_scale", **round_info, bet=bet, scale=st["scale"], pnl=st["pnl"])
+                    time.sleep(2)
                 else:
                     time.sleep(5)
                 continue
@@ -1704,6 +1758,7 @@ def run():
                 st["pnl"]   += profit
                 st["scale"]  = 1.0
                 st["consec"] = 0
+                st["next_bet_not_before_ts"] = time.time() + POST_WIN_DELAY_S
                 _log(f"WIN +${profit:.4f}  pnl={st['pnl']:+.4f}  wr={st['wins']}/{st['bets']}")
                 _audit("result", **round_info, settled_round=settled_info, result="win",
                        bet=bet, profit=profit, pnl=st["pnl"],
@@ -1713,6 +1768,7 @@ def run():
                 st["consec"] += 1
                 new_scale     = min(st["scale"] * LOSS_SCALE, MAX_SCALE)
                 st["scale"]   = new_scale
+                st["next_bet_not_before_ts"] = time.time() + POST_LOSS_DELAY_S
                 _log(f"LOSS -${bet:.4f}  pnl={st['pnl']:+.4f}  consec={st['consec']}  next={new_scale:.1f}x")
                 _audit("result", **round_info, settled_round=settled_info, result="loss",
                        bet=bet, profit=-bet, pnl=st["pnl"],
@@ -1730,11 +1786,19 @@ def run():
                     target_gid = str(int(round_info.get("game_round_id", 0)) + 1)
                     row = None
                     for _retry in range(4):  # 3 retries x 10s = 30s max wait
-                        with duckdb.connect(str(ROUNDS_DB), read_only=True) as _conn:
-                            row = _conn.execute(
-                                "SELECT multiplier FROM rounds WHERE game_round_id = ? LIMIT 1",
-                                [target_gid]
-                            ).fetchone()
+                        try:
+                            with duckdb.connect(str(ROUNDS_DB), read_only=True) as _conn:
+                                row = _conn.execute(
+                                    "SELECT multiplier FROM rounds WHERE game_round_id = ? LIMIT 1",
+                                    [target_gid]
+                                ).fetchone()
+                        except Exception as _lock_err:
+                            low = str(_lock_err).lower()
+                            if ("lock" in low or "conflicting" in low or "database is locked" in low) and _retry < 3:
+                                _log(f"Round {target_gid} DB lock, retry {_retry+1}/3 in 10s...")
+                                time.sleep(10)
+                                continue
+                            raise
                         if row:
                             break
                         if _retry < 3:
@@ -1746,6 +1810,7 @@ def run():
                         if actual_mult >= CASHOUT:
                             profit = bet * (CASHOUT - 1.0)
                             st["wins"] += 1; st["pnl"] += profit; st["scale"] = 1.0; st["consec"] = 0
+                            st["next_bet_not_before_ts"] = time.time() + POST_WIN_DELAY_S
                             _log(f"WIN(db) +${profit:.4f}  pnl={st['pnl']:+.4f}  wr={st['wins']}/{st['bets']}")
                             _audit("result_db", **round_info, result="win", bet=bet,
                                    actual_mult=actual_mult, pnl=st["pnl"],
@@ -1754,6 +1819,7 @@ def run():
                             st["pnl"] -= bet; st["consec"] += 1
                             new_scale = min(st["scale"] * LOSS_SCALE, MAX_SCALE)
                             st["scale"] = new_scale
+                            st["next_bet_not_before_ts"] = time.time() + POST_LOSS_DELAY_S
                             _log(f"LOSS(db) -${bet:.4f}  mult={actual_mult:.2f}x  pnl={st['pnl']:+.4f}  consec={st['consec']}")
                             _audit("result_db", **round_info, result="loss", bet=bet,
                                    actual_mult=actual_mult, pnl=st["pnl"],
@@ -1766,10 +1832,12 @@ def run():
                                 _audit("cooldown_reset", **round_info, scale=1.0, pnl=st["pnl"])
                     else:
                         # Round not in DB yet — skip without updating state
+                        st["next_bet_not_before_ts"] = time.time() + POST_LOSS_DELAY_S
                         _log(f"Round {target_gid} not in DB — skipping (no state change)")
                         _audit("result_unknown", **round_info, bet=bet, pnl=st["pnl"],
                                bets=st["bets"], scale=st["scale"])
                 except Exception as _db_err:
+                    st["next_bet_not_before_ts"] = time.time() + POST_LOSS_DELAY_S
                     _log(f"DB result lookup error: {_db_err} — skipping")
 
             # Read real balance: DOM scan header (live) + API fallback
