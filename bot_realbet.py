@@ -1854,7 +1854,7 @@ def run():
                             let node;
                             while ((node = walker.nextNode())) {
                                 const t = node.textContent.trim();
-                                const m = t.match(/^\$(\d+\.\d{2})$/);
+                                const m = t.match(/^\\$(\\d+\\.\\d{2})$/);
                                 if (m) {
                                     const n = parseFloat(m[1]);
                                     if (n > 0.5 && n < 100000) return n;
