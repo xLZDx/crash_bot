@@ -111,6 +111,7 @@ def _load_state():
         "wins": 0,
         "pnl": 0.0,
         "next_bet_not_before_ts": 0.0,
+        "last_place_error_game_round_id": "",
     }
 
 
@@ -1559,6 +1560,25 @@ def run():
 
             round_info = _latest_round_info()
             current_round_id = round_info.get("round_id")
+            current_game_round_id = str(round_info.get("game_round_id") or "")
+
+            # Prevent re-sending in the same game round after a known place_error
+            # (most often late-window/suspended), which otherwise causes duplicate skips.
+            last_err_gid = str(st.get("last_place_error_game_round_id") or "")
+            if current_game_round_id and last_err_gid == current_game_round_id:
+                _audit(
+                    "same_round_error_guard",
+                    **round_info,
+                    reason="prior_place_error_same_game_round",
+                    scale=st["scale"],
+                    pnl=st["pnl"],
+                )
+                time.sleep(0.4)
+                continue
+            if last_err_gid and current_game_round_id and last_err_gid != current_game_round_id:
+                st["last_place_error_game_round_id"] = ""
+                _save_state(st)
+
             if current_round_id and st.get("last_decision_round_id") == current_round_id:
                 _audit(
                     "duplicate_round_guard",
@@ -1643,6 +1663,20 @@ def run():
                 st["last_decision_round_id"] = current_round_id
                 _save_state(st)
             ws_status = _direct_ws_status(page)
+            if EXECUTOR == "ws" and (not ws_status.get("has_ws") or ws_status.get("ready_state") != 1):
+                _log(f"WS warmup: not ready (state={ws_status.get('ready_state')}) — skipping round")
+                _audit(
+                    "ws_warmup_not_ready",
+                    **round_info,
+                    bet=bet,
+                    direct_ws=ws_status,
+                    scale=st["scale"],
+                    pnl=st["pnl"],
+                )
+                st["last_place_error_game_round_id"] = current_game_round_id
+                _save_state(st)
+                time.sleep(1.0)
+                continue
             _audit(
                 "bet_attempt",
                 **round_info,
@@ -1728,6 +1762,8 @@ def run():
                 err_str = str(e).lower()
                 _log(f"Place error: {e} — skipping round")
                 _audit("place_error", **round_info, bet=bet, error=str(e), scale=st["scale"], pnl=st["pnl"])
+                st["last_place_error_game_round_id"] = current_game_round_id
+                _save_state(st)
                 if "bet suspended" in err_str or "game has started" in err_str:
                     # Late-bet reject is a timing skip, not a strategy failure.
                     # Preserve intended recovery scale for the next round.
