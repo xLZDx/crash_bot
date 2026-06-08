@@ -56,9 +56,11 @@ BASE_BET_USD     = 0.01      # $0.01 = BCGame minimum
 # Do NOT hardcode duplicates here -- a stale copy (e.g. MAX_SCALE=64) is dead
 # code (overwritten below) but misleads readers into thinking the cap differs
 # from the configured/backtested strategy. Single source of truth = STRATEGY_CFG.
-STOP_LOSS_PCT    = 0.50      # stop at -$6
-TAKE_PROFIT_PCT  = 1.0       # stop at +$12
-POST_LOSS_DELAY_S = 7.0      # after loss, delay next bet attempt
+STOP_LOSS_USD    = float(os.environ.get("REALBET_STOP_LOSS_USD", "6.0"))
+TAKE_PROFIT_PCT  = 1.0       # take-profit at +100% of BANK_USD
+MIN_REAL_BALANCE_USD = float(os.environ.get("REALBET_MIN_REAL_BALANCE_USD", "5.0"))
+INSUFF_BALANCE_ERROR_LIMIT = int(os.environ.get("REALBET_INSUFF_BALANCE_ERROR_LIMIT", "3"))
+POST_LOSS_DELAY_S = 6.0      # after loss, delay next bet attempt
 POST_WIN_DELAY_S  = 1.0      # after win, short delay before next attempt
 INPUT_RETRIES    = 5
 ROUND_SETTLE_TIMEOUT = 95
@@ -112,6 +114,7 @@ def _load_state():
         "pnl": 0.0,
         "next_bet_not_before_ts": 0.0,
         "last_place_error_game_round_id": "",
+        "insufficient_balance_errors_consec": 0,
     }
 
 
@@ -1498,6 +1501,45 @@ def run():
         else:
             _log(f"EXECUTOR=ws: skipping UI cashout (cashout={CASHOUT}x is in WS packet, avoids BCGame auto-bet)")
 
+        if EXECUTOR == "ws":
+            _log("WS startup warmup: waiting for stable WS + betting window before first live cycle")
+            warmup_ok = False
+            for attempt in range(40):
+                try:
+                    warmup_ws = _direct_ws_status(page)
+                    _, warmup_btn_text = _find_bet_button(page)
+                except Exception:
+                    warmup_ws = {}
+                    warmup_btn_text = ""
+                ready = (
+                    warmup_ws.get("has_ws")
+                    and warmup_ws.get("ready_state") == 1
+                    and warmup_ws.get("last_packet_id") is not None
+                    and _button_ready(warmup_btn_text)
+                )
+                if ready:
+                    _log(
+                        "WS startup warmup: ready "
+                        f"(btn={warmup_btn_text[:40]}, packet_id={warmup_ws.get('last_packet_id')})"
+                    )
+                    _audit(
+                        "ws_startup_warmup_ready",
+                        btn=warmup_btn_text,
+                        direct_ws=warmup_ws,
+                        attempts=attempt + 1,
+                    )
+                    warmup_ok = True
+                    break
+                if attempt in (0, 4, 9, 19, 29, 39):
+                    _log(
+                        "WS startup warmup: still waiting "
+                        f"(btn={warmup_btn_text[:40]}, ws_state={warmup_ws.get('ready_state')}, packet_id={warmup_ws.get('last_packet_id')})"
+                    )
+                page.wait_for_timeout(500)
+            if not warmup_ok:
+                _log("WS startup warmup: timed out, continuing with runtime guards enabled")
+                _audit("ws_startup_warmup_timeout", direct_ws=_direct_ws_status(page))
+
         import time as _time
         last_snap_t = 0
 
@@ -1518,9 +1560,15 @@ def run():
                 STOP_FLAG.unlink(missing_ok=True)
                 break
 
-            # Check stop-loss / take-profit
-            if st["pnl"] <= -(BANK_USD * STOP_LOSS_PCT):
-                _log(f"STOP LOSS: pnl={st['pnl']:+.4f}")
+            # Check hard stop-loss / take-profit
+            if st["pnl"] <= -STOP_LOSS_USD:
+                _log(f"STOP LOSS: pnl={st['pnl']:+.4f} <= -${STOP_LOSS_USD:.2f}")
+                _audit("stop_loss_hit", pnl=st["pnl"], stop_loss_usd=STOP_LOSS_USD)
+                break
+            real_bal = st.get("last_balance_usd")
+            if isinstance(real_bal, (int, float)) and real_bal < MIN_REAL_BALANCE_USD:
+                _log(f"REAL BALANCE STOP: balance=${real_bal:.4f} < ${MIN_REAL_BALANCE_USD:.2f}")
+                _audit("real_balance_stop", balance_usd=real_bal, min_balance_usd=MIN_REAL_BALANCE_USD, pnl=st["pnl"])
                 break
             if st["pnl"] >= BANK_USD * TAKE_PROFIT_PCT:
                 _log(f"TAKE PROFIT: pnl={st['pnl']:+.4f}")
@@ -1787,6 +1835,37 @@ def run():
                 _log(f"Place error: {e} — skipping round")
                 _audit("place_error", **round_info, bet=bet, error=str(e), scale=st["scale"], pnl=st["pnl"])
                 st["last_place_error_game_round_id"] = current_game_round_id
+                if "insufficient balance" in err_str:
+                    st["insufficient_balance_errors_consec"] = int(st.get("insufficient_balance_errors_consec", 0)) + 1
+                    _log(
+                        "Insufficient balance streak: "
+                        f"{st['insufficient_balance_errors_consec']}/{INSUFF_BALANCE_ERROR_LIMIT}"
+                    )
+                    _audit(
+                        "insufficient_balance_error",
+                        **round_info,
+                        bet=bet,
+                        streak=st["insufficient_balance_errors_consec"],
+                        streak_limit=INSUFF_BALANCE_ERROR_LIMIT,
+                        pnl=st["pnl"],
+                    )
+                    if st["insufficient_balance_errors_consec"] >= INSUFF_BALANCE_ERROR_LIMIT:
+                        _log(
+                            "INSUFFICIENT BALANCE STOP: "
+                            f"streak {st['insufficient_balance_errors_consec']} >= {INSUFF_BALANCE_ERROR_LIMIT}"
+                        )
+                        _audit(
+                            "insufficient_balance_stop",
+                            **round_info,
+                            streak=st["insufficient_balance_errors_consec"],
+                            streak_limit=INSUFF_BALANCE_ERROR_LIMIT,
+                            pnl=st["pnl"],
+                            balance_usd=st.get("last_balance_usd"),
+                        )
+                        _save_state(st)
+                        break
+                else:
+                    st["insufficient_balance_errors_consec"] = 0
                 _save_state(st)
                 if "bet suspended" in err_str or "game has started" in err_str:
                     # Late-bet reject is a timing skip, not a strategy failure.
@@ -1794,9 +1873,15 @@ def run():
                     _log(f"BET SUSPENDED: carry scale={st['scale']:.1f} to next round (no reset)")
                     _audit("suspended_carry_scale", **round_info, bet=bet, scale=st["scale"], pnl=st["pnl"])
                     time.sleep(2)
+                elif "insufficient balance" in err_str:
+                    time.sleep(2)
                 else:
                     time.sleep(5)
                 continue
+
+            if st.get("insufficient_balance_errors_consec"):
+                st["insufficient_balance_errors_consec"] = 0
+                _save_state(st)
 
             # --- STEP 4: wait for collector to settle the bet round ---
             settled_info = _wait_for_settled_round(current_round_id, bet_game_round_id=round_info.get("game_round_id"), page=page)
@@ -2068,5 +2153,10 @@ if __name__ == "__main__":
     LOG_FILE.parent.mkdir(exist_ok=True, parents=True)
     _log("=" * 50)
     _log(f"bot_realbet.py  bank=${BANK_USD}  base_bet=${BASE_BET_USD}  cashout={CASHOUT}x")
+    _log(
+        "risk: "
+        f"stop_loss=${STOP_LOSS_USD:.2f}, min_balance=${MIN_REAL_BALANCE_USD:.2f}, "
+        f"insuff_streak_stop={INSUFF_BALANCE_ERROR_LIMIT}"
+    )
     _log(f"Stop: create file {STOP_FLAG}")
     run()
