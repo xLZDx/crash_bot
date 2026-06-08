@@ -1708,13 +1708,37 @@ def run():
                     time.sleep(0.3)
 
                 if EXECUTOR == "ws":
+                    page.wait_for_timeout(120)
+                    try:
+                        _, pre_send_btn_text = _find_bet_button(page)
+                    except Exception:
+                        pre_send_btn_text = ""
+                    pre_send_ws_status = _direct_ws_status(page)
+                    if (not _button_ready(pre_send_btn_text)) or (not pre_send_ws_status.get("has_ws")) or (pre_send_ws_status.get("ready_state") != 1):
+                        _log(
+                            "Pre-send guard: window not ready "
+                            f"(btn={pre_send_btn_text}, ws_state={pre_send_ws_status.get('ready_state')}) — skipping round"
+                        )
+                        _audit(
+                            "pre_send_window_guard",
+                            **round_info,
+                            bet=bet,
+                            btn=pre_send_btn_text,
+                            direct_ws=pre_send_ws_status,
+                            scale=st["scale"],
+                            pnl=st["pnl"],
+                        )
+                        st["last_place_error_game_round_id"] = current_game_round_id
+                        _save_state(st)
+                        time.sleep(0.4)
+                        continue
                     send_started = time.time()
-                    direct_sent = _send_direct_ws_bet(page, ws_status, round_info, est_sol)
+                    direct_sent = _send_direct_ws_bet(page, pre_send_ws_status, round_info, est_sol)
                     page.wait_for_timeout(800)
                     if _last_bet_reject[0] >= send_started:
                         raise Exception(f"Bet rejected by server: {_last_bet_reject[1][:160]}")
                     post_ws_status = _direct_ws_status(page)
-                    ws_shadow = _ws_shadow_compare(ws_status, post_ws_status, round_info, est_sol)
+                    ws_shadow = _ws_shadow_compare(pre_send_ws_status, post_ws_status, round_info, est_sol)
                     _audit("direct_ws_sent", **round_info, bet=bet, direct=direct_sent,
                            post_ws=post_ws_status, ws_shadow=ws_shadow,
                            scale=st["scale"], pnl=st["pnl"], cashout=CASHOUT)
