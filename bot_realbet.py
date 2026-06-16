@@ -1735,7 +1735,7 @@ def run():
                 direct_ws=ws_status,
             )
 
-            bal_before = _read_balance(page)
+            bal_before = _presend_balance(EXECUTOR, _balance_from_api[0], lambda: _read_balance(page))
             try:
                 if EXECUTOR == "ws":
                     # Fast path: skip UI filling entirely, send immediately
@@ -2073,6 +2073,20 @@ def _fetch_balance_fresh(page) -> float | None:
     except Exception:
         pass
     return None
+
+
+def _presend_balance(executor: str, cached, fresh_fn):
+    """Balance for the pre-send audit/log field (bal_before) ONLY.
+
+    On the ws fast path we must NOT block on a fresh /api/user/amount fetch here:
+    a slow fetch (observed up to ~9s) pushes the bet past the betting window and
+    the server rejects it ("Bet suspended. The game has started."). The WS packet
+    (amount + cashout + currency) is the source of truth for the bet itself, so
+    bal_before is non-critical -- use the cached value the response interceptor
+    already maintains. The gui path keeps the fresh read (no WS packet there)."""
+    if str(executor).strip().lower() == "ws":
+        return cached
+    return fresh_fn()
 
 
 def _read_balance(page) -> float | None:
