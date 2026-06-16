@@ -62,6 +62,7 @@ MIN_REAL_BALANCE_USD = float(os.environ.get("REALBET_MIN_REAL_BALANCE_USD", "5.0
 INSUFF_BALANCE_ERROR_LIMIT = int(os.environ.get("REALBET_INSUFF_BALANCE_ERROR_LIMIT", "3"))
 POST_LOSS_DELAY_S = 6.0      # after loss, delay next bet attempt
 POST_WIN_DELAY_S  = 1.0      # after win, short delay before next attempt
+WINDOW_WAIT_TIMEOUT_S = 40.0 # after the post-bet delay, poll up to this long for the betting window to OPEN (round cadence varies 12-67s) instead of one-shot-check-then-skip
 INPUT_RETRIES    = 5
 ROUND_SETTLE_TIMEOUT = 95
 EXECUTOR         = os.environ.get("REALBET_EXECUTOR", "gui").strip().lower()
@@ -999,6 +1000,27 @@ def _send_direct_ws_bet(page, pre_ws: dict, round_info: dict, estimated_sol: str
     }
 
 
+def _wait_for_betting_window(find_button, button_ready, timeout_s, sleeper, clock):
+    """Poll until the betting window is OPEN (button ready), up to timeout_s.
+
+    Round cadence varies (12-67s), so a fixed post-bet delay often lands after a
+    short round's betting window already closed. Rather than one-shot-checking and
+    skipping the round (timing_gate_window_missed), wait for the next window to
+    OPEN and let the bet land at window-open (max margin -> fewer late 'game has
+    started' rejects). Returns (opened: bool, last_button_text: str)."""
+    deadline = clock() + timeout_s
+    last_btn = ""
+    while clock() < deadline:
+        try:
+            _, last_btn = find_button()
+        except Exception:
+            last_btn = ""
+        if button_ready(last_btn):
+            return True, last_btn
+        sleeper(0.2)
+    return False, last_btn
+
+
 def _find_bet_button(page):
     for button in page.query_selector_all("button[class*=button-brand]"):
         box = button.bounding_box()
@@ -1683,12 +1705,19 @@ def run():
                     pnl=st["pnl"],
                 )
                 time.sleep(wait_s)
-                try:
-                    _, gate_btn_text = _find_bet_button(page)
-                except Exception:
-                    gate_btn_text = ""
-                if not _button_ready(gate_btn_text):
-                    _log(f"Timing gate: betting window closed during wait (btn={gate_btn_text})")
+                # Don't one-shot-check-then-skip: round cadence varies (12-67s) so a
+                # short round's window may have closed during wait_s. Wait for the
+                # NEXT window to OPEN, then send at window-open (fewer misses + fewer
+                # 'game has started' late rejects).
+                opened, gate_btn_text = _wait_for_betting_window(
+                    lambda: _find_bet_button(page),
+                    _button_ready,
+                    WINDOW_WAIT_TIMEOUT_S,
+                    lambda s: page.wait_for_timeout(int(s * 1000)),
+                    time.time,
+                )
+                if not opened:
+                    _log(f"Timing gate: no betting window opened within {WINDOW_WAIT_TIMEOUT_S:.0f}s (btn={gate_btn_text})")
                     _audit(
                         "timing_gate_window_missed",
                         **round_info,
@@ -1868,10 +1897,14 @@ def run():
                     st["insufficient_balance_errors_consec"] = 0
                 _save_state(st)
                 if "bet suspended" in err_str or "game has started" in err_str:
-                    # Late-bet reject is a timing skip, not a strategy failure.
-                    # Preserve intended recovery scale for the next round.
-                    _log(f"BET SUSPENDED: carry scale={st['scale']:.1f} to next round (no reset)")
-                    _audit("suspended_carry_scale", **round_info, bet=bet, scale=st["scale"], pnl=st["pnl"])
+                    # Late-bet reject = bet was NOT placed -> reset the martingale
+                    # ladder to base (operator: a rejected bet must not keep an
+                    # elevated scale). _scale_from_audit breaks on suspended_reset.
+                    st["scale"] = 1.0
+                    st["consec"] = 0
+                    _save_state(st)
+                    _log("BET SUSPENDED: reset scale to 1.0 ($0.01) -- bet not placed")
+                    _audit("suspended_reset", **round_info, bet=bet, scale=1.0, pnl=st["pnl"])
                     time.sleep(2)
                 elif "insufficient balance" in err_str:
                     time.sleep(2)
