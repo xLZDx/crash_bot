@@ -738,14 +738,43 @@ def _recent_usd_to_sol_rate() -> float | None:
     return None
 
 
+def _tail_lines(path, max_lines: int = 500, tail_bytes: int = 512 * 1024) -> list[str]:
+    """Return up to the last `max_lines` complete lines of a file by reading ONLY its
+    final `tail_bytes` (not the whole file).
+
+    The realbet audit grows to 100MB+; the old `read_text().splitlines()` read the
+    entire file on EVERY bet -- that was the dominant pre-send latency that pushed the
+    WS packet past the betting window (the technical-miss cause). Tail-read makes the
+    pre-send scale lookup O(tail_bytes) regardless of file size.
+    """
+    try:
+        with open(path, "rb") as f:
+            f.seek(0, 2)
+            size = f.tell()
+            start = max(0, size - tail_bytes)
+            f.seek(start)
+            chunk = f.read()
+        lines = chunk.decode("utf-8", errors="ignore").splitlines()
+        if start > 0 and lines:
+            lines = lines[1:]  # drop the partial first line from the mid-file seek
+        return lines[-max_lines:]
+    except FileNotFoundError:
+        return []
+    except Exception:
+        return []
+
+
 def _scale_from_audit() -> float:
     """Derive current martingale scale from last played game results in audit log.
     Counts consecutive losses since last win. Ignores vetoed/skipped rounds.
+
+    Reads only the audit TAIL (last 500 lines via _tail_lines) -- never the whole
+    100MB+ file -- so this stays off the pre-send critical path.
     """
     try:
-        lines = AUDIT_FILE.read_text(errors="ignore").splitlines()
+        lines = _tail_lines(AUDIT_FILE, max_lines=500)
         consec = 0
-        for line in reversed(lines[-500:]):
+        for line in reversed(lines):
             try:
                 r = json.loads(line)
                 event = r.get("event", "")
@@ -765,7 +794,7 @@ def _scale_from_audit() -> float:
         scale = min(LOSS_SCALE ** consec, MAX_SCALE)
         return scale
     except Exception:
-        return st_fallback_scale if False else 1.0
+        return 1.0
 
 
 def _sol_amount_for_usd_bet(usd_bet: float) -> str | None:
@@ -1785,7 +1814,9 @@ def run():
                     time.sleep(0.3)
 
                 if EXECUTOR == "ws":
-                    page.wait_for_timeout(120)
+                    # (removed a 120ms settle wait -- it was pure pre-send latency that
+                    # narrowed the betting-window headroom; the pre-send guard below
+                    # already re-validates button-ready + WS state before sending)
                     try:
                         _, pre_send_btn_text = _find_bet_button(page)
                     except Exception:
