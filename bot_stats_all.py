@@ -64,8 +64,10 @@ ALIASES = {
 # Paper bots start at $100 USD (all bots migrated from SOL to USD)
 PAPER_START_USD = 100.0
 
-# Live bot deposit amount
-LIVE_START_USD = 24.83
+# Live bot baseline for P&L. Rebaselined 2026-06-18 to the post-deposit balance
+# (operator deposited ~$42; the old $24.83 start made the deposit show as +$39 "profit").
+# P&L = balance - LIVE_START_USD now measures REAL betting from the new balance.
+LIVE_START_USD = 63.98
 
 
 def _describe(cfg: StrategyConfig) -> str:
@@ -372,8 +374,12 @@ def report_realbet(data_dir: str):
 
     now     = datetime.now(timezone.utc)
     bal_usd = st.get("last_balance_usd", LIVE_START_USD)
-    pnl_all = bal_usd - LIVE_START_USD
-    pnl_pct = pnl_all / LIVE_START_USD if LIVE_START_USD > 0 else 0.0
+    # AUTO P&L: use the bot's internal betting tracker (sum of win/loss outcomes).
+    # Deposit/withdrawal-INDEPENDENT by construction (a deposit changes balance, not
+    # pnl), so it self-corrects forever with no manual baseline. (2026-06-18)
+    pnl_all   = float(st.get("pnl", 0.0))
+    deposited = bal_usd - pnl_all                    # net capital in (start + deposits)
+    pnl_pct   = pnl_all / deposited if deposited > 0 else 0.0
     bets    = st.get("bets", 0)
     wins    = st.get("wins", 0)
     wr      = wins / bets * 100 if bets > 0 else float("nan")
@@ -402,7 +408,7 @@ def report_realbet(data_dir: str):
     print(_c("=" * W, C.BOLD, C.YELLOW))
     ts = now.strftime("%Y-%m-%d  %H:%M:%S UTC")
     print(_c(
-        f"  REAL MONEY BOT  --  {ts}  --  start=${LIVE_START_USD:.2f} USDT",
+        f"  REAL MONEY BOT  --  {ts}  --  P&L=betting only (deposit-adjusted)  capital=${deposited:.2f} USDT",
         C.BOLD, C.YELLOW))
     print(_c("=" * W, C.BOLD, C.YELLOW))
 
