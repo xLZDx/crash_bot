@@ -74,13 +74,16 @@ EXECUTOR         = os.environ.get("REALBET_EXECUTOR", "gui").strip().lower()
 BET_CURRENCY     = os.environ.get("REALBET_CURRENCY", "USDT").strip().upper()
 
 # relwave_bad_veto_21: skip if a local hot wave has flipped into a cold wave.
-STRATEGY_NAME    = "relwave_bad_veto_21"
+STRATEGY_NAME    = "relwave_bad_veto_21_nr512"
 STRATEGY_CFG     = STRATEGIES[STRATEGY_NAME]
 CASHOUT          = STRATEGY_CFG.cashout
 LOSS_SCALE       = STRATEGY_CFG.loss_scale
 MAX_SCALE        = STRATEGY_CFG.max_scale
 CONSEC_TRIGGER   = STRATEGY_CFG.consec_loss_trigger
 COOLDOWN_ROUNDS  = STRATEGY_CFG.consec_loss_pause
+# True (cap-8 strategies): cooldown RESETS scale to 1.0. False (nr512): cooldown PAUSES
+# but the scale CARRIES, so the ladder keeps climbing (16->32->...->MAX_SCALE 512).
+COOLDOWN_RESETS_SCALE = STRATEGY_CFG.cooldown_resets_scale
 REL_BASE_LEN     = STRATEGY_CFG.rel_base_len
 REL_HIGH_LEN     = STRATEGY_CFG.rel_high_len
 REL_LOW_LEN      = STRATEGY_CFG.rel_low_len
@@ -1988,11 +1991,18 @@ def run():
                        bet=bet, profit=-bet, pnl=st["pnl"],
                        consec=st["consec"], bets=st["bets"], scale=st["scale"])
                 if st["consec"] >= CONSEC_TRIGGER:
-                    _log(f"Cooldown: {CONSEC_TRIGGER} losses -> pause {COOLDOWN_ROUNDS} rounds (scale RESET to 1.0)")
                     st["cooldown"] = COOLDOWN_ROUNDS
-                    st["scale"]    = 1.0   # reset ladder so a streak does not stay pinned at MAX ($0.08)
-                    st["consec"]   = 0
-                    _audit("cooldown_reset", **round_info, scale=1.0, pnl=st["pnl"])
+                    st["consec"]   = 0   # next cooldown needs CONSEC_TRIGGER more losses
+                    if COOLDOWN_RESETS_SCALE:
+                        st["scale"] = 1.0   # cap-8 strategies: reset the ladder on cooldown
+                        _log(f"Cooldown: {CONSEC_TRIGGER} losses -> pause {COOLDOWN_ROUNDS} rounds (scale RESET to 1.0)")
+                        _audit("cooldown_reset", **round_info, scale=1.0, pnl=st["pnl"])
+                    else:
+                        # nr512: CARRY the scale through the pause (deep ladder up to MAX_SCALE).
+                        # _scale_from_audit does NOT break on 'cooldown_carry', so the consec-loss
+                        # count keeps climbing across the pause (16 -> 32 -> ... -> 512x = $5.12).
+                        _log(f"Cooldown: {CONSEC_TRIGGER} losses -> pause {COOLDOWN_ROUNDS} rounds (scale CARRIES at {st['scale']:.0f}x)")
+                        _audit("cooldown_carry", **round_info, scale=st["scale"], pnl=st["pnl"])
             else:
                 # Look up actual round result in DB by game_round_id
                 _log(f"Round result unknown — querying DB for game_round {round_info.get('game_round_id')}")
@@ -2039,11 +2049,15 @@ def run():
                                    actual_mult=actual_mult, pnl=st["pnl"],
                                    consec=st["consec"], bets=st["bets"], scale=st["scale"])
                             if st["consec"] >= CONSEC_TRIGGER:
-                                _log(f"Cooldown: {CONSEC_TRIGGER} losses -> pause {COOLDOWN_ROUNDS} rounds (scale RESET to 1.0)")
                                 st["cooldown"] = COOLDOWN_ROUNDS
-                                st["scale"] = 1.0
                                 st["consec"] = 0
-                                _audit("cooldown_reset", **round_info, scale=1.0, pnl=st["pnl"])
+                                if COOLDOWN_RESETS_SCALE:
+                                    st["scale"] = 1.0
+                                    _log(f"Cooldown: {CONSEC_TRIGGER} losses -> pause {COOLDOWN_ROUNDS} rounds (scale RESET to 1.0)")
+                                    _audit("cooldown_reset", **round_info, scale=1.0, pnl=st["pnl"])
+                                else:
+                                    _log(f"Cooldown: {CONSEC_TRIGGER} losses -> pause {COOLDOWN_ROUNDS} rounds (scale CARRIES at {st['scale']:.0f}x)")
+                                    _audit("cooldown_carry", **round_info, scale=st["scale"], pnl=st["pnl"])
                     else:
                         # Round not in DB yet — skip without updating state
                         st["next_bet_not_before_ts"] = time.time() + POST_LOSS_DELAY_S
