@@ -997,6 +997,16 @@ def _ws_shadow_compare(pre_ws: dict, post_ws: dict, round_info: dict, estimated_
         return {"ok": False, "reason": str(exc), "pre_ws": pre_ws, "post_ws": post_ws}
 
 
+def _ws_bet_landed(pre_packet_id, post_packet_id) -> bool:
+    """True iff a WS bet really went out: the observed packet counter advanced. A WS
+    desync makes _send_direct_ws_bet send into a dead socket, so the counter does NOT
+    advance (post stays None, or == pre) -> the bet did NOT land. Used to stop the bot
+    from silently fake-logging 'Placed' (which fabricated pnl + the martingale ladder)."""
+    if post_packet_id is None:
+        return False
+    return post_packet_id != pre_packet_id
+
+
 def _send_direct_ws_bet(page, pre_ws: dict, round_info: dict, estimated_sol: str) -> dict:
     if not estimated_sol:
         raise Exception("direct_ws_missing_estimated_sol")
@@ -1858,6 +1868,36 @@ def run():
                     _audit("direct_ws_sent", **round_info, bet=bet, direct=direct_sent,
                            post_ws=post_ws_status, ws_shadow=ws_shadow,
                            scale=st["scale"], pnl=st["pnl"], cashout=CASHOUT)
+                    # GUARD (anti fake-bet): only count the bet if the WS packet counter
+                    # advanced (a twice-bet frame really went out). On a WS desync the send
+                    # goes nowhere -> counter does NOT advance -> do NOT log Placed / do NOT
+                    # settle as a real bet (avoids fabricated pnl + ladder). 3 in a row -> exit
+                    # for a clean restart (re-establishes the betting WS).
+                    if not _ws_bet_landed((pre_send_ws_status or {}).get("last_packet_id"),
+                                          (post_ws_status or {}).get("last_packet_id")):
+                        st["ws_unconfirmed_consec"] = int(st.get("ws_unconfirmed_consec", 0)) + 1
+                        _save_state(st)
+                        _log("WS BET UNCONFIRMED: packet did not advance "
+                             f"(pre={(pre_send_ws_status or {}).get('last_packet_id')} "
+                             f"post={(post_ws_status or {}).get('last_packet_id')}) -- NOT counted "
+                             f"(consec={st['ws_unconfirmed_consec']})")
+                        _audit("ws_bet_unconfirmed", **round_info, bet=bet,
+                               pre_packet=(pre_send_ws_status or {}).get("last_packet_id"),
+                               post_packet=(post_ws_status or {}).get("last_packet_id"),
+                               consec=st["ws_unconfirmed_consec"], scale=st["scale"], pnl=st["pnl"])
+                        if st["ws_unconfirmed_consec"] >= 3:
+                            _log("WS desync: 3 unconfirmed bets in a row -> exiting for a clean "
+                                 "restart (monitor/operator relaunches; fresh page re-establishes WS)")
+                            _audit("ws_desync_exit", **round_info,
+                                   consec=st["ws_unconfirmed_consec"], pnl=st["pnl"])
+                            st["ws_unconfirmed_consec"] = 0
+                            _save_state(st)
+                            break
+                        time.sleep(1)
+                        continue
+                    if st.get("ws_unconfirmed_consec"):
+                        st["ws_unconfirmed_consec"] = 0
+                        _save_state(st)
                     _log(f"Placed via WS. Balance: {f'${bal_before:.4f}' if bal_before else 'unknown'}")
                     _audit("bet_placed", **round_info, bet=bet, balance_before=bal_before,
                            direct_ws=post_ws_status, ws_shadow=ws_shadow,
