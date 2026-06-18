@@ -60,7 +60,12 @@ STOP_LOSS_USD    = float(os.environ.get("REALBET_STOP_LOSS_USD", "6.0"))
 TAKE_PROFIT_PCT  = 1.0       # take-profit at +100% of BANK_USD
 MIN_REAL_BALANCE_USD = float(os.environ.get("REALBET_MIN_REAL_BALANCE_USD", "5.0"))
 INSUFF_BALANCE_ERROR_LIMIT = int(os.environ.get("REALBET_INSUFF_BALANCE_ERROR_LIMIT", "3"))
-POST_LOSS_DELAY_S = 6.0      # after loss, delay next bet attempt
+POST_LOSS_DELAY_S = 1.0      # after loss, delay next bet attempt. Was 6.0 -> data
+                            # (2026-06-18) showed 320/325 late-reject misses happened
+                            # after the 6s delay (it skipped ~6s into the ~8s betting
+                            # window -> send landed near close). Post-WIN's 1.0s delay
+                            # had only 4/1636 rejects (0.24%). Matched to 1.0 to enter
+                            # the window early; window-wait poll still waits for OPEN.
 POST_WIN_DELAY_S  = 1.0      # after win, short delay before next attempt
 WINDOW_WAIT_TIMEOUT_S = 40.0 # after the post-bet delay, poll up to this long for the betting window to OPEN (round cadence varies 12-67s) instead of one-shot-check-then-skip
 INPUT_RETRIES    = 5
