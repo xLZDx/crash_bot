@@ -88,6 +88,9 @@ ACK_TIMEOUT_S = float(os.environ.get("REALBET_ACK_TIMEOUT_S", "2.0"))
 # (likely WS/session/identity problem). The bet was NOT placed in each case, so
 # no money is lost -- this just stops spinning + flags the operator to investigate.
 ACK_NO_CONFIRM_EXIT_STREAK = int(os.environ.get("REALBET_ACK_NO_CONFIRM_EXIT_STREAK", "6"))
+# How long to poll /api/game/bet/recent-bet/ for OUR bet to appear (landing proof)
+# before treating the bet as NOT placed. HTTP, so a touch longer than the WS ack.
+RECENT_BET_TIMEOUT_S = float(os.environ.get("REALBET_RECENT_BET_TIMEOUT_S", "6.0"))
 INPUT_RETRIES    = 5
 ROUND_SETTLE_TIMEOUT = 95
 EXECUTOR         = os.environ.get("REALBET_EXECUTOR", "gui").strip().lower()
@@ -1078,6 +1081,69 @@ def _maybe_set_identity(body) -> bool:
     return False
 
 
+def _recent_bet_match(data, round_id, amount, our_uid=None) -> bool:
+    """True iff OUR bet for `round_id` (amount match) is in a /api/game/bet/recent-bet/
+    `data` array. Each entry: {gameId, betAmount, currencyName, userId, winAmount, ...}.
+    This is the authoritative landing proof (ground-truth bet history)."""
+    if not data:
+        return False
+    rid = str(round_id)
+    for e in data:
+        try:
+            if str(e.get("gameId")) != rid:
+                continue
+            if not _amounts_equal(e.get("betAmount"), amount):
+                continue
+            uid = e.get("userId")
+            if our_uid is not None and uid is not None and str(uid) != str(our_uid):
+                continue
+            return True
+        except (TypeError, ValueError, AttributeError):
+            continue
+    return False
+
+
+def _recent_bet_fetch(page, size: int = 20) -> dict:
+    """Query /api/game/bet/recent-bet/ via the authenticated page (browser context =
+    auto auth + routed through the VPN cgroup). Returns {status:int, data:list|None}."""
+    try:
+        return page.evaluate(
+            """async (size) => {
+                try {
+                    const r = await fetch('/api/game/bet/recent-bet/', {
+                        method: 'POST',
+                        headers: {'content-type': 'application/json'},
+                        body: JSON.stringify({gameUrl: 'crash', size: size}),
+                    });
+                    if (r.status !== 200) return {status: r.status, data: null};
+                    const j = await r.json();
+                    return {status: 200, data: j.data || []};
+                } catch (e) { return {status: -1, data: null}; }
+            }""",
+            size,
+        )
+    except Exception:
+        return {"status": -1, "data": None}
+
+
+def _recent_bet_status(page) -> int:
+    """HTTP status of a recent-bet probe. 200 = on the unblocked home IP;
+    403 = blocked datacenter IP / VPN routing broken; -1 on error."""
+    res = _recent_bet_fetch(page, size=1)
+    try:
+        return int(res.get("status"))
+    except (TypeError, ValueError):
+        return -1
+
+
+def _recent_bet_confirms(page, round_id, amount, our_uid=None) -> bool:
+    """True iff OUR bet for round_id is present in recent-bet right now (= it landed)."""
+    res = _recent_bet_fetch(page, size=20)
+    if not res or res.get("status") != 200:
+        return False
+    return _recent_bet_match(res.get("data"), round_id, amount, our_uid=our_uid)
+
+
 def _ws_shadow_compare(pre_ws: dict, post_ws: dict, round_info: dict, estimated_sol: str | None) -> dict:
     try:
         actual = _parse_twice_bet_packet_b64(post_ws.get("last_payload_b64"))
@@ -1782,6 +1848,18 @@ def run():
                 _log("WS startup warmup: timed out, continuing with runtime guards enabled")
                 _audit("ws_startup_warmup_timeout", direct_ws=_direct_ws_status(page))
 
+        # VPN-routing guard: recent-bet must return 200 = we're on the unblocked home
+        # IP (via the vpnbot cgroup). 403 = datacenter IP / VPN routing broken -> every
+        # bet would be a phantom (silently dropped). Fail fast instead of spinning.
+        _rb_status = _recent_bet_status(page)
+        if _rb_status != 200:
+            _log(f"VPN ROUTING GUARD: recent-bet returned {_rb_status} (need 200) -- bot is "
+                 "NOT on the unblocked home IP. Refusing to bet (every bet would be phantom). "
+                 "Check the vpnbot cgroup routing. Exiting.")
+            _audit("vpn_routing_guard_fail", recent_bet_status=_rb_status)
+            return
+        _log("VPN routing OK: recent-bet reachable (200) -- betting enabled.")
+
         import time as _time
         last_snap_t = 0
 
@@ -2083,32 +2161,36 @@ def run():
                     if st.get("ws_unconfirmed_consec"):
                         st["ws_unconfirmed_consec"] = 0
                         _save_state(st)
-                    # --- ACK-GATE: require POSITIVE landing confirmation ---
-                    # Packet-advanced is NOT proof of landing: a send into a closed
-                    # betting window is silently ignored (no reject frame). Require the
-                    # server's own 'tb' echo of OUR bet before settling. No echo within
-                    # ACK_TIMEOUT_S -> bet was NOT placed: do NOT log Placed, do NOT
-                    # settle, do NOT advance the ladder; retry next window.
+                    # --- LANDING-GATE: confirm via /api/game/bet/recent-bet/ ---
+                    # The authoritative, IP-unblocked source = OUR own bet history.
+                    # A sent packet is NOT proof of landing (a send into a closed window
+                    # is silently ignored). Require OUR bet for this round to appear in
+                    # recent-bet. Not found within RECENT_BET_TIMEOUT_S -> bet was NOT
+                    # placed: no Placed, no settle, ladder unchanged; retry next window.
                     _target_round = int(round_info["game_round_id"]) + 1
-                    _ack_deadline = send_started + ACK_TIMEOUT_S
-                    while not _bet_ack_fresh(_target_round, est_sol) and time.time() < _ack_deadline:
-                        page.wait_for_timeout(80)
-                    _pending_bet["round"] = None
-                    if not _bet_ack_fresh(_target_round, est_sol):
+                    _pending_bet["round"] = None   # tb-echo recording kept for telemetry only
+                    _landed = False
+                    _rb_deadline = send_started + RECENT_BET_TIMEOUT_S
+                    while time.time() < _rb_deadline:
+                        if _recent_bet_confirms(page, _target_round, est_sol, our_uid=_our_uid):
+                            _landed = True
+                            break
+                        page.wait_for_timeout(500)
+                    if not _landed:
                         st["ws_no_ack_consec"] = int(st.get("ws_no_ack_consec", 0)) + 1
                         _save_state(st)
-                        _log(f"BET NOT CONFIRMED (no landing ack) round={_target_round} "
+                        _log(f"BET NOT CONFIRMED (not in recent-bet) round={_target_round} "
                              f"${bet_str} -- NOT placed; no settle, ladder unchanged "
                              f"(consec={st['ws_no_ack_consec']})")
                         _audit("bet_unplaced", **round_info, bet=bet,
-                               target_round=_target_round, reason="no_landing_ack",
+                               target_round=_target_round, reason="not_in_recent_bet",
                                consec=st["ws_no_ack_consec"], scale=st["scale"], pnl=st["pnl"])
                         st["last_place_error_game_round_id"] = current_game_round_id
                         _save_state(st)
                         if st["ws_no_ack_consec"] >= ACK_NO_CONFIRM_EXIT_STREAK:
-                            _log(f"ACK DESYNC: {st['ws_no_ack_consec']} bets with no landing "
-                                 "ack in a row -> exiting for clean restart. INVESTIGATE the ack "
-                                 "signal (does the exchange echo our own 'tb'?) before relaunch.")
+                            _log(f"ACK DESYNC: {st['ws_no_ack_consec']} bets not confirmed in "
+                                 "recent-bet in a row -> exiting for clean restart. Check VPN "
+                                 "routing (recent-bet 200?) + betting-window timing before relaunch.")
                             _audit("ack_desync_exit", **round_info,
                                    consec=st["ws_no_ack_consec"], pnl=st["pnl"])
                             st["ws_no_ack_consec"] = 0
@@ -2119,7 +2201,7 @@ def run():
                     if st.get("ws_no_ack_consec"):
                         st["ws_no_ack_consec"] = 0
                         _save_state(st)
-                    _log(f"Placed via WS (ack-confirmed round={_target_round}). "
+                    _log(f"Placed via WS (confirmed in recent-bet, round={_target_round}). "
                          f"Balance: {f'${bal_before:.4f}' if bal_before else 'unknown'}")
                     _audit("bet_placed", **round_info, bet=bet, balance_before=bal_before,
                            direct_ws=post_ws_status, ws_shadow=ws_shadow,

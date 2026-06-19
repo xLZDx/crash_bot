@@ -46,11 +46,28 @@ real balance bled ~$1/day on the few bets that actually landed.
   `_pending_bet`; bet loop arms before send + ACK-GATE waits <= ACK_TIMEOUT_S for
   the echo, else `bet_unplaced` (no settle / no ladder move) + retry; 6 no-acks ->
   exit+flag. Tests: `tests/test_realbet_ack_wiring.py` (7). Live loop now gated.
-- **Commit 3 (next, pending first-live-run data)** — D (route EVERY bet through
-  `_wait_for_betting_window`, not only post-loss) IF the live confirm-rate is low
-  + optional `/api/user/amount/` USDT-debit fallback. Deferred because the ack-gate
-  already makes phantom sends harmless (retry, $0 lost); the first live run reveals
-  the real confirm rate + confirms the exchange echoes our own 'tb'.
+- **Commit 2 LIVE RUN (2026-06-19 21:19 UTC)** — tb-echo confirmed 0/6 bets ->
+  bot self-exited on ACK DESYNC, $0 lost (safety worked). Root cause found via the
+  operator's "watch the transaction tab" idea: `/api/game/bet/recent-bet/` returns
+  **403 from the VPS** (100%, since 2026-06-01) -> the VPS datacenter IP (+ IPv6
+  2400:d320.., JP, Contabo) is IP-blocked by BCGame. So bets don't land + tb has
+  nothing to echo. The file always said "Run LOCALLY (VPS IPs are blocked)".
+- **VPN ROUTING (per-bot, SSH-safe)** — the operator's home OpenVPN (tun0) exits at
+  188.244.21.9 (StarNet/Chisinau = residential, the operator's own clean IP). Set up
+  cgroup `vpnbot` + table 200 (default via tun0) + fwmark + MASQUERADE->10.8.0.6 +
+  IPv6-drop. Only the bot's traffic routes via the home IP; SSH/collector untouched.
+  VERIFIED: cgroup egress = 188.244.21.9 AND `recent-bet` now returns **200** with
+  the full bet list. recent-bet not persistent yet (in-memory) -> ops follow-up.
+- **Commit 3 (DONE)** — landing confirmed via `/api/game/bet/recent-bet/` (ground
+  truth, the operator's approach) instead of the tb-echo: after send, poll recent-bet
+  <= RECENT_BET_TIMEOUT_S(6s) for OUR bet (`gameId==round + betAmount + userId`);
+  found -> settle; not found -> bet_unplaced (no settle/ladder), 6 in a row -> exit.
+  + startup VPN guard: recent-bet must be 200 (= on the home IP) or the bot refuses
+  to bet. tb-echo recording kept as telemetry only. Tests: test_realbet_recent_bet.py
+  (13). Launch must put the bot PID in /sys/fs/cgroup/vpnbot/cgroup.procs.
+- **Follow-ups** — persist VPN + cgroup routing across reboot/VPN-reconnect (the VPN
+  was launched with `timeout 15`, fragile); optionally use recent-bet `winAmount` as
+  the authoritative result; D (window alignment) only if confirm-rate is low.
 
 ## Scope boundaries
 No change to strategy nr512 / cashout / martingale math; paper bots & collector
