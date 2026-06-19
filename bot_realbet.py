@@ -1850,12 +1850,21 @@ def run():
 
         # VPN-routing guard: recent-bet must return 200 = we're on the unblocked home
         # IP (via the vpnbot cgroup). 403 = datacenter IP / VPN routing broken -> every
-        # bet would be a phantom (silently dropped). Fail fast instead of spinning.
-        _rb_status = _recent_bet_status(page)
+        # bet would be a phantom (silently dropped). Retry a few times -- a startup
+        # connection/tunnel race can 403 the first call then recover. Only after the
+        # whole window stays non-200 do we refuse to bet (fail safe, $0 lost).
+        _rb_status = None
+        for _gi in range(12):
+            _rb_status = _recent_bet_status(page)
+            if _rb_status == 200:
+                break
+            if _gi in (0, 3, 7):
+                _log(f"VPN routing guard: recent-bet={_rb_status} (need 200), retrying...")
+            page.wait_for_timeout(2500)
         if _rb_status != 200:
-            _log(f"VPN ROUTING GUARD: recent-bet returned {_rb_status} (need 200) -- bot is "
-                 "NOT on the unblocked home IP. Refusing to bet (every bet would be phantom). "
-                 "Check the vpnbot cgroup routing. Exiting.")
+            _log(f"VPN ROUTING GUARD: recent-bet stayed {_rb_status} (need 200) over ~30s -- bot "
+                 "is NOT on the unblocked home IP. Refusing to bet (every bet would be phantom). "
+                 "Check the vpnbot cgroup routing + tun0. Exiting.")
             _audit("vpn_routing_guard_fail", recent_bet_status=_rb_status)
             return
         _log("VPN routing OK: recent-bet reachable (200) -- betting enabled.")
