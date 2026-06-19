@@ -47,6 +47,13 @@ _ws_betting_phase: dict = {}  # {game_round_id: str -> True} when betting phase 
 # bet from a phantom send into a closed betting window. WIRED INTO on_received +
 # the bet loop in a LATER commit; defined here but not yet consulted by live code.
 _last_bet_ack: dict = {"game_round_id": None, "amount": None, "ts": 0.0}
+# Our BCGame identity (loaded from /api/account/get/ at runtime), used to match
+# OUR OWN 'tb' bet broadcast among all players'. None until the page loads it.
+_our_uid = None
+_our_name = None
+# Pending bet context for ack matching: round we bet on + amount sent. Armed by
+# the bet loop just before sending; consulted by on_received to record our echo.
+_pending_bet: dict = {"round": None, "amount": None}
 
 # WS frame constants (from BCGame /g/cm protocol)
 _CM_PREFIX = b"/g/cm"
@@ -77,6 +84,10 @@ WINDOW_WAIT_TIMEOUT_S = 40.0 # after the post-bet delay, poll up to this long fo
 # after sending a bet, before treating the bet as NOT placed. Consulted by the
 # bet loop in a LATER commit.
 ACK_TIMEOUT_S = float(os.environ.get("REALBET_ACK_TIMEOUT_S", "2.0"))
+# After this many bets in a row with NO landing ack, exit for a clean restart
+# (likely WS/session/identity problem). The bet was NOT placed in each case, so
+# no money is lost -- this just stops spinning + flags the operator to investigate.
+ACK_NO_CONFIRM_EXIT_STREAK = int(os.environ.get("REALBET_ACK_NO_CONFIRM_EXIT_STREAK", "6"))
 INPUT_RETRIES    = 5
 ROUND_SETTLE_TIMEOUT = 95
 EXECUTOR         = os.environ.get("REALBET_EXECUTOR", "gui").strip().lower()
@@ -474,6 +485,8 @@ def _install_network_capture(page):
                 headers=_redact_headers(resp.headers),
                 body=_short(body),
             )
+            if body and "account/get" in (resp.url or ""):
+                _maybe_set_identity(body)
         except Exception:
             pass
 
@@ -497,6 +510,13 @@ def _install_network_capture(page):
                     raw_bytes = payload if isinstance(payload, bytes) else (
                         payload.encode("latin-1", errors="replace") if isinstance(payload, str) else b""
                     )
+                    # Positive bet-landing ack: if a bet is armed, record OUR OWN
+                    # 'tb' echo (round+currency+amount+identity) so the loop can
+                    # confirm the bet landed vs a phantom send into a closed window.
+                    _pb = _pending_bet
+                    if _pb.get("round") is not None:
+                        _note_tb_ack(raw_bytes, round_id=_pb["round"], amount=_pb["amount"],
+                                     our_name=_our_name, our_uid=_our_uid)
                     gid, mult = _parse_ws_round_frame(raw_bytes)
                     if gid and mult is not None:
                         _ws_round_cache[gid] = {"mult": mult, "ts": time.time()}
@@ -1041,6 +1061,21 @@ def _bet_ack_fresh(round_id, amount, *, now=None, max_age_s=ACK_TIMEOUT_S) -> bo
         return False
     now = time.time() if now is None else now
     return 0.0 <= (now - float(a.get("ts") or 0.0)) <= max_age_s
+
+
+def _maybe_set_identity(body) -> bool:
+    """Load OUR (uid, name) from a /api/account/get/ response once. Idempotent;
+    safe on garbage. Returns True if identity was set by this call."""
+    global _our_uid, _our_name
+    if _our_uid is not None or _our_name is not None:
+        return False
+    ident = _identity_from_account_get(body)
+    if ident.get("uid") is not None or ident.get("name"):
+        _our_uid = ident.get("uid")
+        _our_name = ident.get("name")
+        _log(f"Identity loaded: name={_our_name} uid={_our_uid}")
+        return True
+    return False
 
 
 def _ws_shadow_compare(pre_ws: dict, post_ws: dict, round_info: dict, estimated_sol: str | None) -> dict:
@@ -1996,6 +2031,18 @@ def run():
                         _save_state(st)
                         time.sleep(0.4)
                         continue
+                    if _our_name is None and _our_uid is None:
+                        _log("Account identity not loaded yet -- skipping round "
+                             "(ack-gate needs it to confirm OUR bet landed)")
+                        _audit("identity_not_loaded", **round_info, bet=bet,
+                               scale=st["scale"], pnl=st["pnl"])
+                        time.sleep(1.0)
+                        continue
+                    # Arm ack matching for THIS bet BEFORE sending (echo can arrive
+                    # <800ms; arming first avoids a race). Round we bet on = current+1.
+                    _pending_bet["round"] = int(round_info["game_round_id"]) + 1
+                    _pending_bet["amount"] = est_sol
+                    _last_bet_ack["ts"] = 0.0   # invalidate any prior ack
                     send_started = time.time()
                     direct_sent = _send_direct_ws_bet(page, pre_send_ws_status, round_info, est_sol)
                     page.wait_for_timeout(800)
@@ -2036,7 +2083,44 @@ def run():
                     if st.get("ws_unconfirmed_consec"):
                         st["ws_unconfirmed_consec"] = 0
                         _save_state(st)
-                    _log(f"Placed via WS. Balance: {f'${bal_before:.4f}' if bal_before else 'unknown'}")
+                    # --- ACK-GATE: require POSITIVE landing confirmation ---
+                    # Packet-advanced is NOT proof of landing: a send into a closed
+                    # betting window is silently ignored (no reject frame). Require the
+                    # server's own 'tb' echo of OUR bet before settling. No echo within
+                    # ACK_TIMEOUT_S -> bet was NOT placed: do NOT log Placed, do NOT
+                    # settle, do NOT advance the ladder; retry next window.
+                    _target_round = int(round_info["game_round_id"]) + 1
+                    _ack_deadline = send_started + ACK_TIMEOUT_S
+                    while not _bet_ack_fresh(_target_round, est_sol) and time.time() < _ack_deadline:
+                        page.wait_for_timeout(80)
+                    _pending_bet["round"] = None
+                    if not _bet_ack_fresh(_target_round, est_sol):
+                        st["ws_no_ack_consec"] = int(st.get("ws_no_ack_consec", 0)) + 1
+                        _save_state(st)
+                        _log(f"BET NOT CONFIRMED (no landing ack) round={_target_round} "
+                             f"${bet_str} -- NOT placed; no settle, ladder unchanged "
+                             f"(consec={st['ws_no_ack_consec']})")
+                        _audit("bet_unplaced", **round_info, bet=bet,
+                               target_round=_target_round, reason="no_landing_ack",
+                               consec=st["ws_no_ack_consec"], scale=st["scale"], pnl=st["pnl"])
+                        st["last_place_error_game_round_id"] = current_game_round_id
+                        _save_state(st)
+                        if st["ws_no_ack_consec"] >= ACK_NO_CONFIRM_EXIT_STREAK:
+                            _log(f"ACK DESYNC: {st['ws_no_ack_consec']} bets with no landing "
+                                 "ack in a row -> exiting for clean restart. INVESTIGATE the ack "
+                                 "signal (does the exchange echo our own 'tb'?) before relaunch.")
+                            _audit("ack_desync_exit", **round_info,
+                                   consec=st["ws_no_ack_consec"], pnl=st["pnl"])
+                            st["ws_no_ack_consec"] = 0
+                            _save_state(st)
+                            break
+                        time.sleep(0.5)
+                        continue
+                    if st.get("ws_no_ack_consec"):
+                        st["ws_no_ack_consec"] = 0
+                        _save_state(st)
+                    _log(f"Placed via WS (ack-confirmed round={_target_round}). "
+                         f"Balance: {f'${bal_before:.4f}' if bal_before else 'unknown'}")
                     _audit("bet_placed", **round_info, bet=bet, balance_before=bal_before,
                            direct_ws=post_ws_status, ws_shadow=ws_shadow,
                            executor="ws", scale=st["scale"], pnl=st["pnl"])

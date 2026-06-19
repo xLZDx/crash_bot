@@ -41,9 +41,16 @@ real balance bled ~$1/day on the few bets that actually landed.
   `_tb_is_our_bet`, `_note_tb_ack`, `_bet_ack_fresh`; globals `_last_bet_ack`,
   const `ACK_TIMEOUT_S`. Tests: `tests/test_realbet_ack_match.py` (11),
   `tests/test_realbet_ack_gate.py` (7). Live loop untouched.
-- **Commit 2** — wire the matcher into `on_received` (identity loaded at startup)
-  + settle-gate in the bet loop + no-ack handling + route-through-window + tests.
-- **Commit 3 (optional)** — `/api/user/amount/` USDT-debit fallback/diagnostic.
+- **Commit 2 (DONE)** — live wiring of B/C/E/F: identity loaded from account/get
+  in `on_response`; `on_received` records OUR 'tb' echo against the armed
+  `_pending_bet`; bet loop arms before send + ACK-GATE waits <= ACK_TIMEOUT_S for
+  the echo, else `bet_unplaced` (no settle / no ladder move) + retry; 6 no-acks ->
+  exit+flag. Tests: `tests/test_realbet_ack_wiring.py` (7). Live loop now gated.
+- **Commit 3 (next, pending first-live-run data)** — D (route EVERY bet through
+  `_wait_for_betting_window`, not only post-loss) IF the live confirm-rate is low
+  + optional `/api/user/amount/` USDT-debit fallback. Deferred because the ack-gate
+  already makes phantom sends harmless (retry, $0 lost); the first live run reveals
+  the real confirm rate + confirms the exchange echoes our own 'tb'.
 
 ## Scope boundaries
 No change to strategy nr512 / cashout / martingale math; paper bots & collector
