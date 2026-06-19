@@ -42,6 +42,11 @@ _last_bet_reject: list = [0.0, ""]
 # In-memory cache of last WS round result (from framereceived, no DB needed)
 _ws_round_cache: dict = {}  # {game_round_id: str -> mult: float, ts: float}
 _ws_betting_phase: dict = {}  # {game_round_id: str -> True} when betting phase is open
+# Positive bet-landing ack: set when the server broadcasts OUR OWN 'tb' bet
+# (round + BET_CURRENCY + amount + our identity). Distinguishes a REAL accepted
+# bet from a phantom send into a closed betting window. WIRED INTO on_received +
+# the bet loop in a LATER commit; defined here but not yet consulted by live code.
+_last_bet_ack: dict = {"game_round_id": None, "amount": None, "ts": 0.0}
 
 # WS frame constants (from BCGame /g/cm protocol)
 _CM_PREFIX = b"/g/cm"
@@ -68,6 +73,10 @@ POST_LOSS_DELAY_S = 1.0      # after loss, delay next bet attempt. Was 6.0 -> da
                             # the window early; window-wait poll still waits for OPEN.
 POST_WIN_DELAY_S  = 1.0      # after win, short delay before next attempt
 WINDOW_WAIT_TIMEOUT_S = 40.0 # after the post-bet delay, poll up to this long for the betting window to OPEN (round cadence varies 12-67s) instead of one-shot-check-then-skip
+# Max time to wait for the server's positive landing ack (our own 'tb' echo)
+# after sending a bet, before treating the bet as NOT placed. Consulted by the
+# bet loop in a LATER commit.
+ACK_TIMEOUT_S = float(os.environ.get("REALBET_ACK_TIMEOUT_S", "2.0"))
 INPUT_RETRIES    = 5
 ROUND_SETTLE_TIMEOUT = 95
 EXECUTOR         = os.environ.get("REALBET_EXECUTOR", "gui").strip().lower()
@@ -903,6 +912,135 @@ def _parse_twice_bet_packet_b64(payload_b64: str | None) -> dict:
         "field15": fields.get(15),
         "field16": fields.get(16),
     }
+
+
+def _parse_tb_frame(raw: bytes) -> dict | None:
+    """Parse an incoming BCGame '/g/cm' 'tb' (bet-broadcast) frame.
+
+    The server broadcasts EVERY accepted bet to all players as a 'tb' event:
+      field1=game_round_id (varint), field2=currency (str),
+      field3=amount (str),          field5=username (str).
+
+    Returns {"game_round_id", "currency", "amount", "user"} or None if `raw`
+    is not a 'tb' frame. Used to positively confirm OUR own bet landed (a real
+    accepted bet) vs a phantom send into a closed betting window.
+    """
+    try:
+        idx = raw.find(_CM_PREFIX)            # b"/g/cm"
+        if idx < 0:
+            return None
+        off = idx + len(_CM_PREFIX)
+        if off >= len(raw):
+            return None
+        ev_len = raw[off]
+        off += 1
+        if off + ev_len > len(raw) or raw[off:off + ev_len] != b"tb":
+            return None
+        off += ev_len
+        fields: dict = {}
+        while off < len(raw):
+            key, off = _read_varint(raw, off)
+            fnum = key >> 3
+            wire = key & 7
+            if wire == 0:
+                fields[fnum], off = _read_varint(raw, off)
+            elif wire == 2:
+                size, off = _read_varint(raw, off)
+                fields[fnum] = raw[off:off + size]
+                off += size
+            elif wire == 5:
+                fields[fnum] = raw[off:off + 4]
+                off += 4
+            elif wire == 1:
+                fields[fnum] = raw[off:off + 8]
+                off += 8
+            else:
+                break
+
+        def _s(x):
+            return x.decode("utf-8", "ignore") if isinstance(x, (bytes, bytearray)) else x
+
+        return {
+            "game_round_id": fields.get(1),
+            "currency": _s(fields.get(2)),
+            "amount": _s(fields.get(3)),
+            "user": _s(fields.get(5)),
+        }
+    except (ValueError, IndexError):
+        return None
+
+
+def _amounts_equal(a, b) -> bool:
+    """USDT bet amounts ($0.01 granularity) compared as floats; NaN/None safe."""
+    try:
+        fa, fb = float(a), float(b)
+    except (TypeError, ValueError):
+        return False
+    if fa != fa or fb != fb:   # NaN guard
+        return False
+    return abs(fa - fb) < 1e-6
+
+
+def _identity_from_account_get(body) -> dict:
+    """Extract our (uid, name) from a /api/account/get/ response (dict or JSON str)."""
+    try:
+        d = body if isinstance(body, dict) else json.loads(body)
+        data = d.get("data") or {}
+        uid = data.get("uid") or data.get("userId") or data.get("uniqueUid")
+        return {"uid": int(uid) if uid is not None else None, "name": data.get("name")}
+    except (TypeError, ValueError, AttributeError, json.JSONDecodeError):
+        return {"uid": None, "name": None}
+
+
+def _tb_is_our_bet(tb: dict | None, *, round_id, amount, our_name=None, our_uid=None) -> bool:
+    """True iff a parsed 'tb' frame is OUR accepted bet: same round + BET_CURRENCY
+    + same amount + our identity (username or uid). Identity is the disambiguator
+    from other players betting the same currency/amount on the same round."""
+    if not tb:
+        return False
+    if str(tb.get("currency") or "").upper() != BET_CURRENCY:
+        return False
+    try:
+        if int(tb.get("game_round_id")) != int(round_id):
+            return False
+    except (TypeError, ValueError):
+        return False
+    if not _amounts_equal(tb.get("amount"), amount):
+        return False
+    user = str(tb.get("user") or "")
+    if not user:
+        return False
+    name_ok = bool(our_name) and (user == str(our_name) or str(our_name) in user)
+    uid_ok = bool(our_uid) and (user == str(our_uid) or str(our_uid) in user)
+    return name_ok or uid_ok
+
+
+def _note_tb_ack(raw: bytes, *, round_id, amount, our_name=None, our_uid=None) -> bool:
+    """If `raw` is OUR accepted-bet broadcast, record it as the landing ack.
+    Returns True on match. (Wired into on_received in a LATER commit.)"""
+    tb = _parse_tb_frame(raw)
+    if _tb_is_our_bet(tb, round_id=round_id, amount=amount,
+                      our_name=our_name, our_uid=our_uid):
+        _last_bet_ack["game_round_id"] = tb["game_round_id"]
+        _last_bet_ack["amount"] = tb["amount"]
+        _last_bet_ack["ts"] = time.time()
+        return True
+    return False
+
+
+def _bet_ack_fresh(round_id, amount, *, now=None, max_age_s=ACK_TIMEOUT_S) -> bool:
+    """True iff a positive landing ack for (round_id, amount) was recorded within
+    max_age_s. Consulted by the bet loop in a LATER commit to gate settlement."""
+    a = _last_bet_ack
+    try:
+        if a.get("game_round_id") is None or int(a["game_round_id"]) != int(round_id):
+            return False
+    except (TypeError, ValueError):
+        return False
+    if not _amounts_equal(a.get("amount"), amount):
+        return False
+    now = time.time() if now is None else now
+    return 0.0 <= (now - float(a.get("ts") or 0.0)) <= max_age_s
 
 
 def _ws_shadow_compare(pre_ws: dict, post_ws: dict, round_info: dict, estimated_sol: str | None) -> dict:
