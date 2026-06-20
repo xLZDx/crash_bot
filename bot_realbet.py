@@ -1503,7 +1503,10 @@ def run():
             headless=IS_VPS,
             args=[
                 "--disable-blink-features=AutomationControlled",
-                "--disable-web-security",
+                # NOTE: do NOT add "--disable-web-security" -- Cloudflare/BCGame
+                # fingerprints that flag as automation and 403s every game/bet API
+                # (proven by bisect 2026-06-20: only_websec -> 403, no_websec -> 200).
+                # The bot only fetches same-origin (bcgame61.com), so it is not needed.
                 "--no-sandbox",
                 "--disable-dev-shm-usage",
                 "--disable-popup-blocking",
