@@ -87,7 +87,11 @@ ACK_TIMEOUT_S = float(os.environ.get("REALBET_ACK_TIMEOUT_S", "2.0"))
 # After this many bets in a row with NO landing ack, exit for a clean restart
 # (likely WS/session/identity problem). The bet was NOT placed in each case, so
 # no money is lost -- this just stops spinning + flags the operator to investigate.
-ACK_NO_CONFIRM_EXIT_STREAK = int(os.environ.get("REALBET_ACK_NO_CONFIRM_EXIT_STREAK", "6"))
+# Raised 6 -> 15 (2026-06-20): confirmation moved to post-settle, and most bets miss
+# the betting window (a normal, expected outcome -- NOT a VPN failure). The startup VPN
+# guard already catches "can't reach recent-bet"; this streak only catches "can place
+# NOTHING for a long run" (window always closed / session dead).
+ACK_NO_CONFIRM_EXIT_STREAK = int(os.environ.get("REALBET_ACK_NO_CONFIRM_EXIT_STREAK", "15"))
 # How long to poll /api/game/bet/recent-bet/ for OUR bet to appear (landing proof)
 # before treating the bet as NOT placed. HTTP, so a touch longer than the WS ack.
 RECENT_BET_TIMEOUT_S = float(os.environ.get("REALBET_RECENT_BET_TIMEOUT_S", "6.0"))
@@ -2173,51 +2177,19 @@ def run():
                     if st.get("ws_unconfirmed_consec"):
                         st["ws_unconfirmed_consec"] = 0
                         _save_state(st)
-                    # --- LANDING-GATE: confirm via /api/game/bet/recent-bet/ ---
-                    # The authoritative, IP-unblocked source = OUR own bet history.
-                    # A sent packet is NOT proof of landing (a send into a closed window
-                    # is silently ignored). Require OUR bet for this round to appear in
-                    # recent-bet. Not found within RECENT_BET_TIMEOUT_S -> bet was NOT
-                    # placed: no Placed, no settle, ladder unchanged; retry next window.
+                    # --- bet SENT; landing is confirmed AFTER settle (STEP 4.5) ---
+                    # recent-bet has multi-second latency; a SEND-time check misses a bet
+                    # that lands but appears late (2026-06-20: round 9357416 landed yet was
+                    # logged "not placed" by the old 6s send-time window -> real $ spent,
+                    # untracked). By round-settle time the latency is fully absorbed, so we
+                    # confirm there instead (and skip the wasted wait on bets that miss the
+                    # window -- the round settle happens regardless).
                     _target_round = int(round_info["game_round_id"]) + 1
                     _pending_bet["round"] = None   # tb-echo recording kept for telemetry only
-                    _landed = False
-                    _rb_deadline = send_started + RECENT_BET_TIMEOUT_S
-                    while time.time() < _rb_deadline:
-                        if _recent_bet_confirms(page, _target_round, est_sol, our_uid=_our_uid):
-                            _landed = True
-                            break
-                        page.wait_for_timeout(500)
-                    if not _landed:
-                        st["ws_no_ack_consec"] = int(st.get("ws_no_ack_consec", 0)) + 1
-                        _save_state(st)
-                        _log(f"BET NOT CONFIRMED (not in recent-bet) round={_target_round} "
-                             f"${bet_str} -- NOT placed; no settle, ladder unchanged "
-                             f"(consec={st['ws_no_ack_consec']})")
-                        _audit("bet_unplaced", **round_info, bet=bet,
-                               target_round=_target_round, reason="not_in_recent_bet",
-                               consec=st["ws_no_ack_consec"], scale=st["scale"], pnl=st["pnl"])
-                        st["last_place_error_game_round_id"] = current_game_round_id
-                        _save_state(st)
-                        if st["ws_no_ack_consec"] >= ACK_NO_CONFIRM_EXIT_STREAK:
-                            _log(f"ACK DESYNC: {st['ws_no_ack_consec']} bets not confirmed in "
-                                 "recent-bet in a row -> exiting for clean restart. Check VPN "
-                                 "routing (recent-bet 200?) + betting-window timing before relaunch.")
-                            _audit("ack_desync_exit", **round_info,
-                                   consec=st["ws_no_ack_consec"], pnl=st["pnl"])
-                            st["ws_no_ack_consec"] = 0
-                            _save_state(st)
-                            break
-                        time.sleep(0.5)
-                        continue
-                    if st.get("ws_no_ack_consec"):
-                        st["ws_no_ack_consec"] = 0
-                        _save_state(st)
-                    _log(f"Placed via WS (confirmed in recent-bet, round={_target_round}). "
-                         f"Balance: {f'${bal_before:.4f}' if bal_before else 'unknown'}")
-                    _audit("bet_placed", **round_info, bet=bet, balance_before=bal_before,
+                    _log(f"Bet sent via WS (round={_target_round}) ${bet_str} -- awaiting settle+confirm")
+                    _audit("bet_sent", **round_info, bet=bet, target_round=_target_round,
                            direct_ws=post_ws_status, ws_shadow=ws_shadow,
-                           executor="ws", scale=st["scale"], pnl=st["pnl"])
+                           scale=st["scale"], pnl=st["pnl"])
                     post_click_text = "direct_ws"
                 else:
                     post_click_text = None
@@ -2321,6 +2293,43 @@ def run():
                 result = "win" if settled_mult >= CASHOUT else "loss"
                 _audit("round_settled", **round_info, settled_round=settled_info,
                        result=result, settled_mult=settled_mult, bet=bet, cashout=CASHOUT)
+
+            # --- STEP 4.5: confirm the bet LANDED via recent-bet (latency-tolerant) ---
+            # The round has now settled, so a landed bet is present in recent-bet (its
+            # multi-second latency from send is fully absorbed). A bet NOT in recent-bet
+            # after settle truly did NOT land (missed the betting window) -> do NOT record
+            # it (no settle, no ladder, no pnl). This is the real-money safety: only count
+            # bets the exchange actually accepted.
+            if EXECUTOR == "ws":
+                _conf_round = int(round_info["game_round_id"]) + 1
+                _conf_deadline = time.time() + RECENT_BET_TIMEOUT_S
+                _landed = _recent_bet_confirms(page, _conf_round, est_sol, our_uid=_our_uid)
+                while not _landed and time.time() < _conf_deadline:
+                    page.wait_for_timeout(1000)
+                    _landed = _recent_bet_confirms(page, _conf_round, est_sol, our_uid=_our_uid)
+                if not _landed:
+                    st["ws_no_ack_consec"] = int(st.get("ws_no_ack_consec", 0)) + 1
+                    _save_state(st)
+                    _log(f"BET NOT CONFIRMED (not in recent-bet after settle) round={_conf_round} "
+                         f"${bet_str} -- NOT placed; no settle, ladder unchanged "
+                         f"(consec={st['ws_no_ack_consec']})")
+                    _audit("bet_unplaced", **round_info, bet=bet, target_round=_conf_round,
+                           reason="not_in_recent_bet_after_settle",
+                           consec=st["ws_no_ack_consec"], scale=st["scale"], pnl=st["pnl"])
+                    if st["ws_no_ack_consec"] >= ACK_NO_CONFIRM_EXIT_STREAK:
+                        _log(f"ACK DESYNC: {st['ws_no_ack_consec']} bets not landed in a row -> "
+                             "exiting for clean restart. Check betting-window timing / VPN.")
+                        _audit("ack_desync_exit", **round_info,
+                               consec=st["ws_no_ack_consec"], pnl=st["pnl"])
+                        st["ws_no_ack_consec"] = 0
+                        _save_state(st)
+                        break
+                    time.sleep(0.5)
+                    continue
+                if st.get("ws_no_ack_consec"):
+                    st["ws_no_ack_consec"] = 0
+                    _save_state(st)
+                _log(f"Bet CONFIRMED landed (recent-bet) round={_conf_round} ${bet_str}")
 
             # --- STEP 5: record result ---
             st["bets"] += 1
