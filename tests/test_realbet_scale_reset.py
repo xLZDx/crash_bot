@@ -1,7 +1,16 @@
-"""Scalefix regression: the real bot's martingale scale must RESET after a
-cooldown (or an unplaced/suspended bet), not stay pinned at MAX ($0.08) for a
-whole losing streak. Tests _scale_from_audit directly by pointing AUDIT_FILE at
-synthetic audit logs."""
+"""Scalefix regression for _scale_from_audit (pointed at synthetic audit logs).
+
+Streak-ending markers (reset the ladder to 1):
+  - cooldown_reset  : cap-8 strategies reset on the 4-loss cooldown.
+  - suspended_reset : LEGACY (no longer emitted) -- kept so old tails still parse.
+
+Streak-PRESERVING markers (ladder keeps climbing -- 2026-06-20 nr512 fix):
+  - suspended_retry : a missed betting window placed NO money, so the loss it
+    tried to recover is still owed -> the SAME (doubled) stake is retried next
+    round. Resetting here was the flat-$0.01 bug.
+  - cooldown_carry  : nr512 carries the scale through the cooldown pause, so a
+    deep streak climbs toward MAX_SCALE (512x = $5.12), not pinned low.
+"""
 import json
 import os
 import sys
@@ -21,10 +30,12 @@ def _audit(tmp_path, events):
     return p
 
 
-def L():  return {"event": "result", "result": "loss"}
-def W():  return {"event": "result", "result": "win"}
-def CR(): return {"event": "cooldown_reset"}
-def SR(): return {"event": "suspended_reset"}
+def L():   return {"event": "result", "result": "loss"}
+def W():   return {"event": "result", "result": "win"}
+def CR():  return {"event": "cooldown_reset"}
+def SR():  return {"event": "suspended_reset"}   # legacy break marker (no longer emitted)
+def SRT(): return {"event": "suspended_retry"}   # 2026-06-20: missed window -> ladder PRESERVED
+def CC():  return {"event": "cooldown_carry"}    # nr512: cooldown carries the scale
 
 
 def test_ladder_climbs_on_losses(tmp_path):
@@ -48,9 +59,34 @@ def test_loss_after_cooldown_restarts_ladder(tmp_path):
     assert bot_realbet._scale_from_audit() == min(LS ** 1, MAX)   # 2.0 -> $0.02
 
 
-def test_suspended_reset_breaks_streak(tmp_path):
-    _audit(tmp_path, [L(), L(), SR(), L()])    # 1 loss since suspended
+def test_suspended_reset_breaks_streak_legacy(tmp_path):
+    # LEGACY: suspended_reset is no longer emitted, but old audit tails may still
+    # contain it -> it must keep breaking the streak so the post-fix deploy does not
+    # mis-count old (pre-fix) flat losses. 1 loss since the legacy marker -> 2.0.
+    _audit(tmp_path, [L(), L(), SR(), L()])
     assert bot_realbet._scale_from_audit() == min(LS ** 1, MAX)   # 2.0
+
+
+def test_suspended_retry_preserves_ladder(tmp_path):
+    # 2026-06-20 fix: a missed betting window (suspended_retry) placed NO money, so it
+    # must NOT break the streak. 3 losses across a retry -> ladder = 2**3 = 8x ($0.08),
+    # NOT reset to 1.0 (the old flat-$0.01 bug).
+    _audit(tmp_path, [W(), L(), SRT(), L(), SRT(), L()])
+    assert bot_realbet._scale_from_audit() == min(LS ** 3, MAX)   # 8.0
+
+
+def test_cooldown_carry_preserves_ladder(tmp_path):
+    # nr512: cooldown_carry does NOT break the streak (the scale carries through the
+    # pause). 5 losses with a carry after the 4th -> 2**5 = 32x, not reset.
+    _audit(tmp_path, [W(), L(), L(), L(), L(), CC(), L()])
+    assert bot_realbet._scale_from_audit() == min(LS ** 5, MAX)   # 32.0
+
+
+def test_deep_streak_climbs_to_cap(tmp_path):
+    # Deep nr512 streak with carries every 4 losses reaches MAX_SCALE (512x = $5.12).
+    events = [W()] + [L()] * 4 + [CC()] + [L()] * 4 + [CC()] + [L()] * 2  # 10 losses
+    _audit(tmp_path, events)
+    assert bot_realbet._scale_from_audit() == MAX   # 512.0 ($5.12) -- the real tail risk
 
 
 def test_nine_loss_streak_not_pinned_at_max(tmp_path):

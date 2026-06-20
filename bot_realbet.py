@@ -823,9 +823,14 @@ def _scale_from_audit() -> float:
                 r = json.loads(line)
                 event = r.get("event", "")
                 result = r.get("result", "")
-                # A scale-reset marker (cooldown OR an unplaced/suspended bet) ends
-                # the consecutive-loss count -> the ladder restarts at 1 ($0.01) after
-                # it, so a long losing streak does NOT stay pinned at MAX_SCALE ($0.08).
+                # Streak-ending markers: cooldown_reset (cap-8 strategies reset the ladder on
+                # cooldown) + the LEGACY suspended_reset (kept ONLY so old audit tails still
+                # parse -- it is no longer emitted). Deliberately NOT in this set:
+                #   - cooldown_carry: nr512 CARRIES the scale through the cooldown pause.
+                #   - suspended_retry: a missed betting window placed NO money, so the loss it
+                #     tried to recover is still un-recovered -> the ladder MUST be preserved
+                #     (2026-06-20 fix: reset-on-miss was the flat-$0.01 bug that erased every
+                #     martingale step). MAX_SCALE (line below) still caps the streak at 512x.
                 if event in ("cooldown_reset", "suspended_reset"):
                     break
                 if event in ("result", "result_db", "result_balance"):
@@ -2264,14 +2269,18 @@ def run():
                     st["insufficient_balance_errors_consec"] = 0
                 _save_state(st)
                 if "bet suspended" in err_str or "game has started" in err_str:
-                    # Late-bet reject = bet was NOT placed -> reset the martingale
-                    # ladder to base (operator: a rejected bet must not keep an
-                    # elevated scale). _scale_from_audit breaks on suspended_reset.
-                    st["scale"] = 1.0
-                    st["consec"] = 0
-                    _save_state(st)
-                    _log("BET SUSPENDED: reset scale to 1.0 ($0.01) -- bet not placed")
-                    _audit("suspended_reset", **round_info, bet=bet, scale=1.0, pnl=st["pnl"])
+                    # Late-bet reject = bet was NOT placed (no money moved). The loss that
+                    # triggered this (possibly doubled) stake is still un-recovered, so the
+                    # martingale ladder MUST be PRESERVED and the SAME stake retried in the
+                    # next fresh betting window. last_place_error_game_round_id (set above)
+                    # makes same_round_error_guard re-sync to the next round -- the same
+                    # window class where base bets already land. Resetting scale here was the
+                    # flat-$0.01 bug (it erased the ladder on every missed window); reverted
+                    # 2026-06-20 per operator GO. _scale_from_audit does NOT break on
+                    # 'suspended_retry', so the owed stake survives the miss.
+                    _log(f"BET SUSPENDED: window missed -- retrying SAME ${bet_str} next round; "
+                         f"ladder preserved (scale={st['scale']:.1f}x)")
+                    _audit("suspended_retry", **round_info, bet=bet, scale=st["scale"], pnl=st["pnl"])
                     time.sleep(2)
                 elif "insufficient balance" in err_str:
                     time.sleep(2)
