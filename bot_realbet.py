@@ -47,6 +47,12 @@ _ws_betting_phase: dict = {}  # {game_round_id: str -> True} when betting phase 
 # bet from a phantom send into a closed betting window. WIRED INTO on_received +
 # the bet loop in a LATER commit; defined here but not yet consulted by live code.
 _last_bet_ack: dict = {"game_round_id": None, "amount": None, "ts": 0.0}
+# DIAGNOSTIC ONLY (2026-06-22, round-id drift pin): records the REAL round of the
+# most recent 'tb' echo with OUR identity, regardless of the bet loop's +1 guess.
+# Telemetry only -- NEVER consulted by control flow. Used to detect when the bot's
+# internal game_round_id (+1) diverges from the exchange round our bet actually
+# landed on (the suspected cause of false 'bet_unplaced' + missed ladder resets).
+_last_our_tb_echo: dict = {"game_round_id": None, "amount": None, "ts": 0.0}
 # Our BCGame identity (loaded from /api/account/get/ at runtime), used to match
 # OUR OWN 'tb' bet broadcast among all players'. None until the page loads it.
 _our_uid = None
@@ -524,6 +530,9 @@ def _install_network_capture(page):
                     if _pb.get("round") is not None:
                         _note_tb_ack(raw_bytes, round_id=_pb["round"], amount=_pb["amount"],
                                      our_name=_our_name, our_uid=_our_uid)
+                    # DIAGNOSTIC ONLY (round-id drift pin): always record OUR latest
+                    # tb echo's REAL round, independent of the +1 guess. Telemetry.
+                    _note_our_tb_echo(raw_bytes, our_name=_our_name, our_uid=_our_uid)
                     gid, mult = _parse_ws_round_frame(raw_bytes)
                     if gid and mult is not None:
                         _ws_round_cache[gid] = {"mult": mult, "ts": time.time()}
@@ -1058,6 +1067,33 @@ def _note_tb_ack(raw: bytes, *, round_id, amount, our_name=None, our_uid=None) -
         _last_bet_ack["ts"] = time.time()
         return True
     return False
+
+
+def _note_our_tb_echo(raw: bytes, *, our_name=None, our_uid=None) -> bool:
+    """DIAGNOSTIC ONLY: if `raw` is a 'tb' broadcast of OUR bet (BET_CURRENCY + our
+    identity), record its REAL round into _last_our_tb_echo -- WITHOUT requiring the
+    round/amount to match the bet loop's +1 guess. Lets the diag compare the round
+    our bet actually landed on vs the guessed _conf_round. NEVER gates control flow.
+    Returns True on a recorded match."""
+    try:
+        tb = _parse_tb_frame(raw)
+        if not tb:
+            return False
+        if str(tb.get("currency") or "").upper() != BET_CURRENCY:
+            return False
+        user = str(tb.get("user") or "")
+        if not user:
+            return False
+        name_ok = bool(our_name) and (user == str(our_name) or str(our_name) in user)
+        uid_ok = bool(our_uid) and (user == str(our_uid) or str(our_uid) in user)
+        if not (name_ok or uid_ok):
+            return False
+        _last_our_tb_echo["game_round_id"] = tb.get("game_round_id")
+        _last_our_tb_echo["amount"] = tb.get("amount")
+        _last_our_tb_echo["ts"] = time.time()
+        return True
+    except Exception:
+        return False
 
 
 def _bet_ack_fresh(round_id, amount, *, now=None, max_age_s=ACK_TIMEOUT_S) -> bool:
@@ -2316,6 +2352,32 @@ def run():
                 while not _landed and time.time() < _conf_deadline:
                     page.wait_for_timeout(1000)
                     _landed = _recent_bet_confirms(page, _conf_round, est_sol, our_uid=_our_uid)
+                # --- DIAGNOSTIC ONLY (round-id drift pin, 2026-06-22) -- NO behavior change.
+                # Records the bot's guessed _conf_round (+1) vs the REAL round of our tb
+                # echo, plus (on a confirm miss) the gameIds actually in our recent-bet.
+                # This pins whether 'bet_unplaced' is a true miss or an id-drift artifact. ---
+                try:
+                    _diag = {
+                        "conf_round": _conf_round,
+                        "landed_recent_bet": bool(_landed),
+                        "our_tb_echo_round": _last_our_tb_echo.get("game_round_id"),
+                        "our_tb_echo_amount": _last_our_tb_echo.get("amount"),
+                        "our_tb_echo_age_s": round(time.time() - float(_last_our_tb_echo.get("ts") or 0.0), 2),
+                        "est_amount": est_sol,
+                        "settled_round": settled_info,
+                    }
+                    if not _landed:
+                        _rb_diag = _recent_bet_fetch(page, size=20)
+                        _rows = (_rb_diag.get("data") or []) if isinstance(_rb_diag, dict) else []
+                        _diag["recent_bet_status"] = _rb_diag.get("status") if isinstance(_rb_diag, dict) else None
+                        _diag["recent_bet_our_gids"] = [
+                            str(e.get("gameId")) for e in _rows
+                            if isinstance(e, dict) and str(e.get("userId")) == str(_our_uid)
+                        ][:8]
+                    _audit("round_id_diag", **round_info, bet=bet,
+                           scale=st["scale"], pnl=st["pnl"], **_diag)
+                except Exception:
+                    pass
                 if not _landed:
                     st["ws_no_ack_consec"] = int(st.get("ws_no_ack_consec", 0)) + 1
                     _save_state(st)
