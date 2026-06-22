@@ -186,6 +186,30 @@ def test_balance_delta_overrides_phantom_win():
     assert real != mult_says
 
 
+# ---------------------------------------------------------------------------
+# Iteration 3 (2026-06-22): demote FALSE recent-bet landings (no balance move).
+# ---------------------------------------------------------------------------
+
+def test_demote_recent_bet_no_movement():
+    # The exact residual bug: recent-bet fallback 'landed' but balance flat -> demote.
+    assert br._should_demote_landing("recent_bet", None) is True
+
+
+def test_no_demote_when_balance_moved():
+    assert br._should_demote_landing("recent_bet", "win") is False
+    assert br._should_demote_landing("recent_bet", "loss") is False
+
+
+def test_no_demote_tb_echo_even_if_inconclusive():
+    # tb_echo is the exchange's own accept broadcast -> trusted even on read-timing None.
+    assert br._should_demote_landing("tb_echo", None) is False
+    assert br._should_demote_landing("tb_echo", "win") is False
+
+
+def test_no_demote_empty_confirm():
+    assert br._should_demote_landing("", None) is False
+
+
 if __name__ == "__main__":
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):

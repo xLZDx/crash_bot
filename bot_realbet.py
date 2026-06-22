@@ -1146,6 +1146,16 @@ def _result_from_balance_delta(bal_before, bal_after, bet) -> "str | None":
         return None
 
 
+def _should_demote_landing(confirm_via, balance_delta_result) -> bool:
+    """iter3 (2026-06-22): a recent-bet-FALLBACK 'landing' with NO balance movement
+    (balance_delta_result is None) is a FALSE landing -- the tolerant conf/-1/-2 match
+    hit an OLDER bet on a neighbour round. A real landed bet MUST move the balance by
+    ~the stake, so zero movement => demote to not-landed (no phantom win/loss, ladder
+    untouched). tb_echo landings are the exchange's own accept broadcast -> trusted
+    even if the balance read was inconclusive (read-timing), so NOT demoted."""
+    return confirm_via == "recent_bet" and balance_delta_result is None
+
+
 def _bet_ack_fresh(round_id, amount, *, now=None, max_age_s=ACK_TIMEOUT_S) -> bool:
     """True iff a positive landing ack for (round_id, amount) was recorded within
     max_age_s. Consulted by the bet loop in a LATER commit to gate settlement."""
@@ -2441,6 +2451,7 @@ def run():
                     # payout (balance UP vs pre-send bal_before); a loss leaves it down by
                     # the stake. Break early on a detected win; else wait out the credit
                     # grace before trusting a loss. Off the betting critical path.
+                    _bd = None
                     try:
                         _bd_deadline = time.time() + 6.0
                         while True:
@@ -2456,6 +2467,16 @@ def run():
                             _result_src = "balance_delta"
                     except Exception:
                         pass
+                    # ITERATION 3 (2026-06-22): a recent-bet-fallback 'landing' with NO
+                    # balance movement is a FALSE landing (tolerant conf/-1/-2 match hit
+                    # an OLDER bet). A real landed bet MUST move the balance by ~the
+                    # stake -> demote to not-landed (handled by the 'if not _landed'
+                    # bet_unplaced path below): no phantom win/loss, ladder untouched.
+                    if _should_demote_landing(_confirm_via, _bd):
+                        _landed = False
+                        _landed_round = None
+                        _confirm_via = ""
+                        _result_src = "demoted_no_balance_move"
                 # --- DIAGNOSTIC (kept): guess vs real round + confirm path + result src ---
                 try:
                     _diag = {
