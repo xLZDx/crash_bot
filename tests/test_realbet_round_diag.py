@@ -145,6 +145,47 @@ def test_result_from_mult_string_and_unknown():
     assert br._result_from_mult("garbage", 2.1) is None
 
 
+# ---------------------------------------------------------------------------
+# Iteration 2 (2026-06-22): authoritative win/loss from REAL balance delta.
+# ---------------------------------------------------------------------------
+
+def test_balance_delta_win():
+    # base $0.01 win: +bet*1.1 -> balance up
+    assert br._result_from_balance_delta(10.0, 10.011, 0.01) == "win"
+    # cap $5.12 win
+    assert br._result_from_balance_delta(38.0, 43.63, 5.12) == "win"
+
+
+def test_balance_delta_loss():
+    assert br._result_from_balance_delta(10.0, 9.99, 0.01) == "loss"      # -bet
+    assert br._result_from_balance_delta(38.0, 32.88, 5.12) == "loss"     # -bet at cap
+
+
+def test_balance_delta_inconclusive_small_move():
+    # move smaller than bet*0.5 -> None (caller keeps prior result, no phantom)
+    assert br._result_from_balance_delta(10.0, 10.002, 0.01) is None      # +0.002 < 0.005
+    assert br._result_from_balance_delta(10.0, 10.0, 0.01) is None        # flat
+    assert br._result_from_balance_delta(10.0, 9.998, 0.01) is None       # -0.002 > -0.005
+
+
+def test_balance_delta_missing_or_garbage():
+    assert br._result_from_balance_delta(None, 10.0, 0.01) is None
+    assert br._result_from_balance_delta(10.0, None, 0.01) is None
+    assert br._result_from_balance_delta(10.0, 10.0, None) is None
+    assert br._result_from_balance_delta(10.0, 10.0, 0) is None           # zero bet -> no thr
+    assert br._result_from_balance_delta("x", 10.0, 0.01) is None
+
+
+def test_balance_delta_overrides_phantom_win():
+    # The exact bug: round-mult said 'win' but the REAL balance fell -> it's a loss.
+    # _result_from_balance_delta on the real balances returns 'loss', which the caller
+    # uses to override the phantom mult result.
+    mult_says = "win"
+    real = br._result_from_balance_delta(35.93, 35.92, 0.01)   # balance went DOWN
+    assert real == "loss"
+    assert real != mult_says
+
+
 if __name__ == "__main__":
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):

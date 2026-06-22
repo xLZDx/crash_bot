@@ -1122,6 +1122,30 @@ def _result_from_mult(mult, cashout) -> "str | None":
         return None
 
 
+def _result_from_balance_delta(bal_before, bal_after, bet) -> "str | None":
+    """AUTHORITATIVE win/loss from the REAL balance change across the bet's round
+    (iteration 2, 2026-06-22). A placed bet nets +bet*(cashout-1) on win (balance UP
+    vs the pre-send balance) or -bet on loss (balance DOWN). The sign of the delta is
+    ground truth -- immune to round-id drift / wrong-round multipliers that caused
+    phantom wins. Returns None when balances are unavailable or the move is too small
+    to classify (caller keeps its prior mult/echo result). Threshold = bet*0.5 sits
+    well inside both real outcomes (win ~+bet*1.1, loss ~-bet) and rejects float noise."""
+    try:
+        if bal_before is None or bal_after is None or bet is None:
+            return None
+        thr = abs(float(bet)) * 0.5
+        if thr <= 0:
+            return None
+        delta = float(bal_after) - float(bal_before)
+        if delta >= thr:
+            return "win"
+        if delta <= -thr:
+            return "loss"
+        return None
+    except (TypeError, ValueError):
+        return None
+
+
 def _bet_ack_fresh(round_id, amount, *, now=None, max_age_s=ACK_TIMEOUT_S) -> bool:
     """True iff a positive landing ack for (round_id, amount) was recorded within
     max_age_s. Consulted by the bet loop in a LATER commit to gate settlement."""
@@ -2396,8 +2420,13 @@ def run():
                         if _landed or time.time() >= _conf_deadline:
                             break
                         page.wait_for_timeout(1000)
-                # Settle win/loss from the REAL landed round's multiplier (WS cache),
-                # falling back to STEP 4's settled_info only if the cache lacks it.
+                # Settle win/loss. ITERATION 2 (2026-06-22): the REAL balance change
+                # across the round is AUTHORITATIVE -- round-mult attribution drifts and
+                # produced phantom wins (pnl + but real balance flat). Compute the
+                # round-mult result first as a fallback, then OVERRIDE with the balance
+                # delta whenever it is conclusive.
+                _bal_after_final = None
+                _result_src = ""
                 if _landed:
                     _lr_mult = (_ws_round_cache.get(str(_landed_round))
                                 or _ws_round_cache.get(_landed_round) or {}).get("mult")
@@ -2407,7 +2436,27 @@ def run():
                     if _r is not None:
                         result = _r
                         settled_mult = _lr_mult
-                # --- DIAGNOSTIC (kept): guess vs real round + confirm path + result ---
+                        _result_src = "mult"
+                    # AUTHORITATIVE: poll fresh balance post-settle. A win credits the
+                    # payout (balance UP vs pre-send bal_before); a loss leaves it down by
+                    # the stake. Break early on a detected win; else wait out the credit
+                    # grace before trusting a loss. Off the betting critical path.
+                    try:
+                        _bd_deadline = time.time() + 6.0
+                        while True:
+                            _bal_after_final = _fetch_balance_fresh(page)
+                            if _result_from_balance_delta(bal_before, _bal_after_final, bet) == "win":
+                                break
+                            if time.time() >= _bd_deadline:
+                                break
+                            page.wait_for_timeout(1000)
+                        _bd = _result_from_balance_delta(bal_before, _bal_after_final, bet)
+                        if _bd is not None:
+                            result = _bd
+                            _result_src = "balance_delta"
+                    except Exception:
+                        pass
+                # --- DIAGNOSTIC (kept): guess vs real round + confirm path + result src ---
                 try:
                     _diag = {
                         "conf_round": _conf_round,
@@ -2416,6 +2465,9 @@ def run():
                         "confirm_via": _confirm_via,
                         "our_tb_echo_round": _last_our_tb_echo.get("game_round_id"),
                         "result": result,
+                        "result_src": _result_src,
+                        "bal_before": bal_before,
+                        "bal_after": _bal_after_final,
                         "est_amount": est_sol,
                     }
                     if not _landed:
