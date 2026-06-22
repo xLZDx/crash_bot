@@ -1096,6 +1096,32 @@ def _note_our_tb_echo(raw: bytes, *, our_name=None, our_uid=None) -> bool:
         return False
 
 
+def _landed_round_from_echo(echo) -> "int | None":
+    """The REAL round our bet landed on, from a FRESH tb echo. The echo ts is reset
+    to 0 just before each send, so any positive ts is THIS bet's echo. The echo round
+    is exchange ground truth (the server broadcast OUR accepted bet); the bot's +1
+    guess drifts (proven 2026-06-22: 13/14 confirm-misses had conf==echo+2), so this
+    is the authoritative landing proof AND the round to settle win/loss from. Returns
+    None when no fresh echo exists (bet did not land / no broadcast)."""
+    try:
+        if echo and float(echo.get("ts") or 0.0) > 0.0 and echo.get("game_round_id") is not None:
+            return int(echo["game_round_id"])
+    except (TypeError, ValueError):
+        pass
+    return None
+
+
+def _result_from_mult(mult, cashout) -> "str | None":
+    """'win' iff the round multiplier reached our cashout, else 'loss'. None if the
+    multiplier is unknown/garbage (caller keeps its prior best-effort result)."""
+    try:
+        if mult is None:
+            return None
+        return "win" if float(mult) >= float(cashout) else "loss"
+    except (TypeError, ValueError):
+        return None
+
+
 def _bet_ack_fresh(round_id, amount, *, now=None, max_age_s=ACK_TIMEOUT_S) -> bool:
     """True iff a positive landing ack for (round_id, amount) was recorded within
     max_age_s. Consulted by the bet loop in a LATER commit to gate settlement."""
@@ -2178,6 +2204,7 @@ def run():
                     _pending_bet["round"] = int(round_info["game_round_id"]) + 1
                     _pending_bet["amount"] = est_sol
                     _last_bet_ack["ts"] = 0.0   # invalidate any prior ack
+                    _last_our_tb_echo["ts"] = 0.0   # invalidate prior echo (echo-anchored confirm)
                     send_started = time.time()
                     direct_sent = _send_direct_ws_bet(page, pre_send_ws_status, round_info, est_sol)
                     page.wait_for_timeout(800)
@@ -2347,24 +2374,49 @@ def run():
             # bets the exchange actually accepted.
             if EXECUTOR == "ws":
                 _conf_round = int(round_info["game_round_id"]) + 1
-                _conf_deadline = time.time() + RECENT_BET_TIMEOUT_S
-                _landed = _recent_bet_confirms(page, _conf_round, est_sol, our_uid=_our_uid)
-                while not _landed and time.time() < _conf_deadline:
-                    page.wait_for_timeout(1000)
-                    _landed = _recent_bet_confirms(page, _conf_round, est_sol, our_uid=_our_uid)
-                # --- DIAGNOSTIC ONLY (round-id drift pin, 2026-06-22) -- NO behavior change.
-                # Records the bot's guessed _conf_round (+1) vs the REAL round of our tb
-                # echo, plus (on a confirm miss) the gameIds actually in our recent-bet.
-                # This pins whether 'bet_unplaced' is a true miss or an id-drift artifact. ---
+                # --- LANDING + OUTCOME anchored to the tb echo's REAL round (2026-06-22 fix).
+                # The exchange broadcasts OUR accepted bet ('tb' echo) carrying the round it
+                # actually landed on. The bot's +1 guess (_conf_round) drifts -- proven by
+                # round_id_diag: 13/14 confirm-misses had conf==echo+2, 0 latency. So PRIMARY
+                # proof = a fresh echo; recent-bet is fallback only (tolerant of the +/-2
+                # drift); and win/loss is settled from the REAL landed round, not
+                # game_round_id+1 (which both mis-confirmed AND mis-attributed outcomes). ---
+                _landed_round = _landed_round_from_echo(_last_our_tb_echo)
+                _landed = _landed_round is not None
+                _confirm_via = "tb_echo" if _landed else ""
+                if not _landed:
+                    _conf_deadline = time.time() + RECENT_BET_TIMEOUT_S
+                    while True:
+                        for _cand in (_conf_round, _conf_round - 1, _conf_round - 2):
+                            if _recent_bet_confirms(page, _cand, est_sol, our_uid=_our_uid):
+                                _landed = True
+                                _landed_round = _cand
+                                _confirm_via = "recent_bet"
+                                break
+                        if _landed or time.time() >= _conf_deadline:
+                            break
+                        page.wait_for_timeout(1000)
+                # Settle win/loss from the REAL landed round's multiplier (WS cache),
+                # falling back to STEP 4's settled_info only if the cache lacks it.
+                if _landed:
+                    _lr_mult = (_ws_round_cache.get(str(_landed_round))
+                                or _ws_round_cache.get(_landed_round) or {}).get("mult")
+                    if _lr_mult is None and isinstance(settled_info, dict):
+                        _lr_mult = settled_info.get("last_mult")
+                    _r = _result_from_mult(_lr_mult, CASHOUT)
+                    if _r is not None:
+                        result = _r
+                        settled_mult = _lr_mult
+                # --- DIAGNOSTIC (kept): guess vs real round + confirm path + result ---
                 try:
                     _diag = {
                         "conf_round": _conf_round,
-                        "landed_recent_bet": bool(_landed),
+                        "landed": bool(_landed),
+                        "landed_round": _landed_round,
+                        "confirm_via": _confirm_via,
                         "our_tb_echo_round": _last_our_tb_echo.get("game_round_id"),
-                        "our_tb_echo_amount": _last_our_tb_echo.get("amount"),
-                        "our_tb_echo_age_s": round(time.time() - float(_last_our_tb_echo.get("ts") or 0.0), 2),
+                        "result": result,
                         "est_amount": est_sol,
-                        "settled_round": settled_info,
                     }
                     if not _landed:
                         _rb_diag = _recent_bet_fetch(page, size=20)

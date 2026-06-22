@@ -100,6 +100,51 @@ def test_no_identity_no_record():
     assert br._last_our_tb_echo["game_round_id"] is None
 
 
+# ---------------------------------------------------------------------------
+# Fix helpers (2026-06-22): anchor landing + outcome to the tb echo's REAL round.
+# ---------------------------------------------------------------------------
+
+def test_landed_round_from_fresh_echo():
+    echo = {"game_round_id": 9362234, "amount": "0.01", "ts": 1.0}  # ts>0 = fresh
+    assert br._landed_round_from_echo(echo) == 9362234
+
+
+def test_landed_round_from_drifted_echo_returns_real_round():
+    # The bug case: bot guessed +1 high; echo carries the REAL (lower) round.
+    echo = {"game_round_id": 9362234, "amount": "0.02", "ts": 12345.0}
+    assert br._landed_round_from_echo(echo) == 9362234   # not the guess
+
+
+def test_landed_round_none_when_stale():
+    echo = {"game_round_id": 9362234, "amount": "0.01", "ts": 0.0}  # reset before send
+    assert br._landed_round_from_echo(echo) is None
+
+
+def test_landed_round_none_when_no_round():
+    assert br._landed_round_from_echo({"game_round_id": None, "amount": None, "ts": 5.0}) is None
+    assert br._landed_round_from_echo(None) is None
+    assert br._landed_round_from_echo({}) is None
+
+
+def test_landed_round_garbage_safe():
+    assert br._landed_round_from_echo({"game_round_id": "notanint", "ts": 5.0}) is None
+    assert br._landed_round_from_echo({"game_round_id": 9362234, "ts": "bad"}) is None
+
+
+def test_result_from_mult_win_loss_boundary():
+    assert br._result_from_mult(2.1, 2.1) == "win"     # exactly cashout = win
+    assert br._result_from_mult(5.15, 2.1) == "win"
+    assert br._result_from_mult(2.07, 2.1) == "loss"   # the real drift example (9362234)
+    assert br._result_from_mult(1.0, 2.1) == "loss"
+
+
+def test_result_from_mult_string_and_unknown():
+    assert br._result_from_mult("5.15", 2.1) == "win"
+    assert br._result_from_mult("2.00", 2.1) == "loss"
+    assert br._result_from_mult(None, 2.1) is None      # unknown -> caller keeps prior
+    assert br._result_from_mult("garbage", 2.1) is None
+
+
 if __name__ == "__main__":
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):
