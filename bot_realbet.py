@@ -2477,30 +2477,27 @@ def run():
                         _landed_round = None
                         _confirm_via = ""
                         _result_src = "demoted_no_balance_move"
-                # --- DIAGNOSTIC (kept): guess vs real round + confirm path + result src ---
+                # --- STEADY-STATE TELEMETRY (trimmed 2026-06-22, drift fix validated):
+                # landing health + outcome attribution in one light line. The heavy
+                # diagnostic fields (conf/landed/echo rounds, est_amount, raw balances,
+                # recent-bet dump + its extra HTTP fetch) are dropped now the round-id
+                # drift root-cause is proven + fixed. result_src is KEPT so a phantom
+                # regression (result_src='mult' with bal_delta ~= 0) stays catchable. ---
                 try:
-                    _diag = {
-                        "conf_round": _conf_round,
-                        "landed": bool(_landed),
-                        "landed_round": _landed_round,
-                        "confirm_via": _confirm_via,
-                        "our_tb_echo_round": _last_our_tb_echo.get("game_round_id"),
-                        "result": result,
-                        "result_src": _result_src,
-                        "bal_before": bal_before,
-                        "bal_after": _bal_after_final,
-                        "est_amount": est_sol,
-                    }
-                    if not _landed:
-                        _rb_diag = _recent_bet_fetch(page, size=20)
-                        _rows = (_rb_diag.get("data") or []) if isinstance(_rb_diag, dict) else []
-                        _diag["recent_bet_status"] = _rb_diag.get("status") if isinstance(_rb_diag, dict) else None
-                        _diag["recent_bet_our_gids"] = [
-                            str(e.get("gameId")) for e in _rows
-                            if isinstance(e, dict) and str(e.get("userId")) == str(_our_uid)
-                        ][:8]
-                    _audit("round_id_diag", **round_info, bet=bet,
-                           scale=st["scale"], pnl=st["pnl"], **_diag)
+                    _bal_delta = None
+                    if bal_before is not None and _bal_after_final is not None:
+                        try:
+                            _bal_delta = round(float(_bal_after_final) - float(bal_before), 6)
+                        except Exception:
+                            _bal_delta = None
+                    _audit("round_telemetry",
+                           landed=bool(_landed),
+                           confirm_via=_confirm_via,
+                           result=result,
+                           result_src=_result_src,
+                           bal_delta=_bal_delta,
+                           scale=st["scale"],
+                           pnl=st["pnl"])
                 except Exception:
                     pass
                 if not _landed:
